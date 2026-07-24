@@ -21,3 +21,7 @@ git add .：递归暂存当前目录及所有子目录中的文件；
 git diff --staged：提交前检查将要上传的内容；
 git commit -m "..."：提交到本地 Git 历史；
 git push：推送到 GitHub。
+
+# 修改提交说明
+git add .
+git commit --amend -m "新的提交说明"
