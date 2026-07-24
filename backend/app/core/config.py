@@ -55,6 +55,12 @@ class Settings(BaseSettings):
     LLM_CONTEXT_TOKEN_RATIO: float = 0.6
     LLM_CONVERSATION_ARCHIVE_HOURS: int = 24
 
+    # ReAct Agent 配置
+    REACT_MAX_ITERATIONS: int = 5           # 最大推理循环轮数
+    REACT_QUALITY_THRESHOLD: float = 0.8    # 自检质量阈值
+    REACT_ENABLE_SELF_CHECK: bool = True    # 是否启用自检
+    REACT_TIMEOUT_SECONDS: int = 60         # 总超时时间（秒）
+
     # 向量数据库配置
     VECTOR_DB_TYPE: str = Field(
         default="chromadb",

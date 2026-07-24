@@ -90,29 +90,183 @@ async def send_message(
         current_query=request.content,
     )
 
-    # 意图匹配：只注入相关工具描述（而非全部工具）
-    from app.services.llm.tools.intent_matcher import intent_matcher
+    # ===== 意图识别（增强版）=====
+    from app.services.llm.intent import IntentResolver
+    from app.services.llm.intent.classifier import IntentCategory, ConfidenceLevel
     from app.services.llm.tools.executor import SmartToolRouter
 
-    # 两阶段工具调用：先尝试预执行
+    intent_resolver = IntentResolver(db=db, redis=redis)
+    plan = await intent_resolver.resolve(request.content, context_messages)
+
+    # 根据执行计划决定工具策略
     tool_router = SmartToolRouter()
-    pre_result = await tool_router.pre_execute(request.content)
-    tools_prompt = tool_router.build_enhanced_prompt(request.content, pre_result)
+    pre_result = None
+    tools_prompt = ""
+
+    if plan.pre_execute_tools:
+        # 高置信度预执行
+        for tool_spec in plan.pre_execute_tools:
+            result = await tool_router.executor.execute_tool(
+                tool_spec["tool"], **tool_spec["params"]
+            )
+            if result and "error" not in result:
+                pre_result = {
+                    "tool": tool_spec["tool"],
+                    "result": result,
+                    "context_injection": str(result),
+                }
+                break
+        tools_prompt = tool_router.build_enhanced_prompt(request.content, pre_result)
+    elif plan.should_inject_tools:
+        # 中/低置信度：注入相关工具描述让 LLM 自主决定
+        from app.services.llm.tools.intent_matcher import intent_matcher
+        tools_prompt = intent_matcher.get_relevant_tools_prompt(
+            plan.intent_result.rewritten_query or request.content
+        )
+
+    # 构建 Prompt 附加指令
+    extra_instructions = "\n".join(plan.prompt_additions) if plan.prompt_additions else ""
 
     # 匹配 Prompt 模板并渲染
     prompt_engine = PromptTemplateEngine(db=db)
     template_id = await prompt_engine.match_template(request.content)
     prompt = await prompt_engine.render(template_id, {
-        "user_query": request.content,
-        "context_docs": "",  # RAG 检索结果由上层填充
+        "user_query": plan.intent_result.rewritten_query or request.content,
+        "context_docs": "" if not plan.should_use_rag else "",
         "memory_context": memory_context,
-        "tools_prompt": tools_prompt,
+        "tools_prompt": tools_prompt + ("\n" + extra_instructions if extra_instructions else ""),
         "conversation_history": "\n".join(
             f"{'用户' if m['role'] == 'user' else '助手'}: {m['content']}"
             for m in context_messages[-10:]
         ),
         "current_time": "",
     })
+
+    # ===== 判断是否使用 ReAct 循环 =====
+    from app.services.llm.intent.resolver import ExecutionPath
+    use_react = plan.path in (
+        ExecutionPath.TOOL_LLM_CALL,
+        ExecutionPath.MULTI_STEP,
+        ExecutionPath.LLM_FALLBACK,
+    ) and plan.should_inject_tools and not pre_result
+
+    if use_react and not request.stream:
+        # 使用 ReAct Agent 循环推理（非流式）
+        from app.services.llm.react import ReActAgent, ReActConfig
+        react_config = ReActConfig(
+            max_iterations=5,
+            quality_threshold=0.8,
+            enable_self_check=True,
+            timeout_seconds=60,
+        )
+        react_agent = ReActAgent(db=db, redis=redis, config=react_config)
+        react_result = await react_agent.run(
+            query=plan.intent_result.rewritten_query or request.content,
+            context=memory_context,
+            tools_prompt=tools_prompt,
+        )
+
+        # 输出过滤
+        filtered_content = security.filter_output(react_result.final_answer)
+
+        # 保存助手消息
+        msg = await manager.add_message(
+            conversation_id,
+            role="assistant",
+            content=filtered_content,
+            model_id=react_result.model_id,
+            input_tokens=react_result.total_input_tokens,
+            output_tokens=react_result.total_output_tokens,
+        )
+
+        # 记录 Token 用量
+        await token_monitor.record_usage(
+            user_id=user_id,
+            department_id=department_id,
+            model_id=react_result.model_id or "unknown",
+            input_tokens=react_result.total_input_tokens,
+            output_tokens=react_result.total_output_tokens,
+            conversation_id=conversation_id,
+        )
+
+        # 写入记忆
+        try:
+            from app.services.llm.memory import MemoryService
+            memory_service = MemoryService(db=db, redis=redis)
+            await memory_service.save_memory(
+                user_id=user_id,
+                question=request.content,
+                answer=filtered_content,
+                conversation_id=conversation_id,
+                message_id=msg.id,
+            )
+        except Exception:
+            pass
+
+        return LLMMessageResponse(
+            message_id=msg.id,
+            role="assistant",
+            content=filtered_content,
+            input_tokens=react_result.total_input_tokens,
+            output_tokens=react_result.total_output_tokens,
+        )
+
+    elif use_react and request.stream:
+        # 使用 ReAct Agent 流式输出推理过程
+        from app.services.llm.react import ReActAgent, ReActConfig
+
+        async def react_event_generator():
+            react_config = ReActConfig(max_iterations=5, quality_threshold=0.8, timeout_seconds=60)
+            react_agent = ReActAgent(db=db, redis=redis, config=react_config)
+
+            try:
+                async for event in react_agent.run_stream(
+                    query=plan.intent_result.rewritten_query or request.content,
+                    context=memory_context,
+                    tools_prompt=tools_prompt,
+                ):
+                    if event["type"] == "thought":
+                        yield f"data: {json.dumps({'type': 'thought', 'content': event['content'], 'iteration': event['iteration']})}\n\n"
+                    elif event["type"] == "action":
+                        yield f"data: {json.dumps({'type': 'action', 'tool': event['tool'], 'iteration': event['iteration']})}\n\n"
+                    elif event["type"] == "observation":
+                        yield f"data: {json.dumps({'type': 'observation', 'content': event['content'], 'iteration': event['iteration']})}\n\n"
+                    elif event["type"] == "final_answer":
+                        final_content = security.filter_output(event["content"])
+
+                        msg = await manager.add_message(
+                            conversation_id, role="assistant", content=final_content,
+                            output_tokens=len(final_content) // 2,
+                        )
+                        await token_monitor.record_usage(
+                            user_id=user_id, department_id=department_id,
+                            model_id="react", input_tokens=0,
+                            output_tokens=len(final_content) // 2,
+                            conversation_id=conversation_id,
+                        )
+                        try:
+                            from app.services.llm.memory import MemoryService
+                            memory_service = MemoryService(db=db, redis=redis)
+                            await memory_service.save_memory(
+                                user_id=user_id, question=request.content,
+                                answer=final_content, conversation_id=conversation_id,
+                                message_id=msg.id,
+                            )
+                        except Exception:
+                            pass
+
+                        await db.commit()
+                        yield f"data: {json.dumps({'type': 'final_answer', 'content': final_content, 'done': True, 'message_id': msg.id, 'iterations': event['iterations'], 'exit_reason': event['exit_reason']})}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+        return StreamingResponse(
+            react_event_generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # ===== 非 ReAct 路径：原有单次调用逻辑 =====
 
     # 调用 LLM
     gateway = LLMGateway(db=db, redis=redis)
