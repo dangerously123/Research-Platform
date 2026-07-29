@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.llm.adapters.base import LLMRequest, LLMResponse
 from app.services.llm.gateway import LLMGateway
+from app.services.llm.token_counter import TokenCounter
 from app.services.llm.tools.executor import ToolExecutor
 from app.services.llm.tools.registry import tool_registry
 
@@ -39,6 +40,8 @@ class ReActConfig:
     max_tokens_per_step: int = 2048    # 每步 LLM 最大 Token
     timeout_seconds: int = 60          # 总超时时间
     allow_chain_tools: bool = True     # 是否允许链式工具调用
+    model_context_window: int = 8192   # 模型上下文窗口大小
+    provider: str = "openai"           # 模型供应商（用于 tokenizer 选择）
 
 
 @dataclass
@@ -134,6 +137,16 @@ class ReActAgent:
         self.config = config or ReActConfig()
         self.gateway = LLMGateway(db=db, redis=redis)
         self.executor = ToolExecutor()
+        # Token 计数器：用于每轮预算控制
+        self.token_counter = TokenCounter.for_provider(
+            self.config.provider, None
+        )
+        # 输入预算 = 上下文窗口 - 输出预留 - 安全边距
+        self._input_budget = (
+            self.config.model_context_window
+            - self.config.max_tokens_per_step
+            - 50  # 安全边距
+        )
         # 工具规划器：每轮动态推荐工具
         from app.services.llm.react.tool_planner import ToolPlanner
         self.tool_planner = ToolPlanner()
@@ -225,7 +238,8 @@ class ReActAgent:
                 # 在后续轮次中追加动态工具建议
                 messages.append({"role": "system", "content": tool_guidance})
 
-            # ① 调用 LLM
+            # ① 调用 LLM（预算控制：确保 messages 不超出上下文窗口）
+            messages = self._trim_messages_to_budget(messages)
             prompt = self._messages_to_prompt(messages)
             try:
                 response = await self.gateway.generate(
@@ -348,6 +362,7 @@ class ReActAgent:
                     })
 
                     # 再调一次 LLM 获取最终回答
+                    messages = self._trim_messages_to_budget(messages)
                     final_prompt = self._messages_to_prompt(messages)
                     try:
                         final_response = await self.gateway.generate(
@@ -465,6 +480,56 @@ class ReActAgent:
             elif role == "assistant":
                 parts.append(f"[Assistant]\n{content}")
         return "\n\n".join(parts)
+
+    def _trim_messages_to_budget(self, messages: list[dict]) -> list[dict]:
+        """
+        确保消息列表不超出输入预算。
+
+        策略：
+        1. 保留第一条 system 消息（不可裁剪）
+        2. 保留最后 2 条消息（最近的上下文）
+        3. 从中间部分（第2条起到倒数第3条）按时间从早到晚移除
+        4. 如果仍超预算，对中间消息的 content 进行截断
+        """
+        total_tokens = self.token_counter.count_messages(messages)
+        if total_tokens <= self._input_budget:
+            return messages
+
+        # 不能裁剪的部分
+        if len(messages) <= 3:
+            # 太少了无法裁剪，直接返回
+            return messages
+
+        # 分离：系统消息 + 中间可裁剪部分 + 最后2条保护
+        system_msgs = [messages[0]] if messages[0]["role"] == "system" else []
+        protected_tail = messages[-2:]
+        middle = messages[len(system_msgs):-2]
+
+        # 从最早的中间消息开始移除
+        while middle:
+            current_messages = system_msgs + middle + protected_tail
+            current_tokens = self.token_counter.count_messages(current_messages)
+            if current_tokens <= self._input_budget:
+                return current_messages
+            # 移除最早的中间消息
+            middle.pop(0)
+
+        # 中间全部移除后仍超预算 → 截断系统消息和保护尾部
+        remaining = system_msgs + protected_tail
+        total_tokens = self.token_counter.count_messages(remaining)
+        if total_tokens <= self._input_budget:
+            return remaining
+
+        # 最后手段：截断保护尾部的 content
+        for msg in protected_tail:
+            if total_tokens <= self._input_budget:
+                break
+            original_tokens = self.token_counter.count(msg["content"])
+            allowed = max(100, original_tokens - (total_tokens - self._input_budget))
+            msg["content"] = self.token_counter.truncate(msg["content"], allowed)
+            total_tokens = self.token_counter.count_messages(system_msgs + protected_tail)
+
+        return system_msgs + protected_tail
 
     def _parse_output(self, text: str) -> tuple[str, str | None, dict | None, str | None]:
         """

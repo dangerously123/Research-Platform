@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.llm import LLMConversation, LLMMessage
+from app.services.llm.token_counter import TokenCounter
 
 
 class ConversationManager:
@@ -16,12 +17,14 @@ class ConversationManager:
     对话管理器。
     - 管理会话生命周期（创建、归档、删除）
     - 维护多轮对话上下文（最近 20 轮）
+    - 使用 TokenCounter 精确计算 Token 消耗
     - 上下文窗口超出 Token 限制时进行摘要压缩
     """
 
     def __init__(self, db: AsyncSession, redis: aioredis.Redis):
         self.db = db
         self.redis = redis
+        self._token_counter = TokenCounter.default()
 
     async def create_conversation(self, user_id: int, title: str | None = None) -> LLMConversation:
         """创建新对话会话。"""
@@ -115,6 +118,149 @@ class ConversationManager:
             pass
 
         return messages, memory_context
+
+    async def build_prompt_with_budget(
+        self,
+        conversation_id: int,
+        user_id: int,
+        current_query: str,
+        system_prompt: str,
+        model_context_window: int = 8192,
+        max_output_tokens: int = 4096,
+        provider: str = "openai",
+        tools_prompt: str = "",
+        rag_docs: str = "",
+    ) -> "AllocationResult":
+        """
+        使用预算分配器构建完整 Prompt（推荐的新接口）。
+
+        流程：
+        1. 获取对话历史（分为最近5轮 + 更早历史）
+        2. 检索长期记忆
+        3. 将所有组件交给 TokenBudgetAllocator 统一裁剪
+        4. 返回 AllocationResult（含裁剪后的各组件和组装好的 Prompt）
+
+        Args:
+            conversation_id: 会话 ID
+            user_id: 用户 ID
+            current_query: 当前用户输入
+            system_prompt: 系统指令文本
+            model_context_window: 模型上下文窗口大小
+            max_output_tokens: 期望最大输出 Token
+            provider: 模型供应商
+            tools_prompt: 工具描述文本
+            rag_docs: RAG 检索文档文本
+
+        Returns:
+            AllocationResult 包含裁剪后的各组件和统计信息
+        """
+        from app.services.llm.budget_allocator import TokenBudgetAllocator, AllocationResult
+
+        # 获取全部对话历史消息
+        all_messages = await self._get_raw_messages(conversation_id)
+
+        # 分割为最近历史和更早历史
+        recent_messages = all_messages[-10:]  # 最近 5 轮
+        older_messages = all_messages[:-10] if len(all_messages) > 10 else []
+
+        # 格式化为文本
+        recent_history = self._format_messages_as_text(recent_messages)
+        older_history = self._format_messages_as_summary(older_messages)
+
+        # 检索长期记忆
+        memory_context = ""
+        try:
+            from app.services.llm.memory import MemoryService
+            memory_service = MemoryService(db=self.db, redis=self.redis)
+            memories = await memory_service.recall(user_id, current_query)
+            if memories:
+                memory_context = memory_service.format_memory_context(memories)
+        except Exception:
+            pass
+
+        # 使用预算分配器
+        allocator = TokenBudgetAllocator(
+            model_context_window=model_context_window,
+            max_output_tokens=max_output_tokens,
+            provider=provider,
+        )
+
+        components = {
+            "system_prompt": system_prompt,
+            "user_query": current_query,
+            "recent_history": recent_history,
+            "older_history": older_history,
+            "memory_context": memory_context,
+            "tools_prompt": tools_prompt,
+            "rag_docs": rag_docs,
+        }
+
+        result = allocator.allocate(components)
+
+        # 记录裁剪警告
+        if result.warnings:
+            import logging
+            logger = logging.getLogger(__name__)
+            for warning in result.warnings:
+                logger.info(f"[TokenBudget] conv={conversation_id} {warning}")
+
+        return result
+
+    def _format_messages_as_text(self, messages: list[dict]) -> str:
+        """将消息列表格式化为对话文本。"""
+        if not messages:
+            return ""
+        parts = []
+        for msg in messages:
+            role_label = "用户" if msg["role"] == "user" else "助手"
+            parts.append(f"{role_label}: {msg['content']}")
+        return "\n".join(parts)
+
+    def _format_messages_as_summary(self, messages: list[dict]) -> str:
+        """将早期消息格式化为摘要文本。"""
+        if not messages:
+            return ""
+        summary_parts = []
+        for msg in messages[-10:]:  # 最多取最近10条早期消息的摘要
+            role_label = "用户" if msg["role"] == "user" else "助手"
+            content_preview = msg["content"][:100]
+            if len(msg["content"]) > 100:
+                content_preview += "..."
+            summary_parts.append(f"{role_label}: {content_preview}")
+        return "[对话历史摘要]:\n" + "\n".join(summary_parts)
+
+    async def _get_raw_messages(self, conversation_id: int) -> list[dict]:
+        """获取原始消息列表（从缓存或数据库）。"""
+        max_turns = settings.LLM_CONTEXT_MAX_TURNS
+        cache_key = f"llm:conv:{conversation_id}"
+        cached = await self.redis.get(cache_key)
+
+        if cached:
+            return json.loads(cached)
+
+        # 从数据库获取最近消息
+        stmt = (
+            select(LLMMessage)
+            .where(LLMMessage.conversation_id == conversation_id)
+            .order_by(LLMMessage.created_at.desc())
+            .limit(max_turns * 2)
+        )
+        result = await self.db.execute(stmt)
+        db_messages = list(reversed(result.scalars().all()))
+
+        messages = [
+            {"role": msg.role, "content": msg.content}
+            for msg in db_messages
+        ]
+
+        # 缓存到 Redis
+        await self.redis.setex(
+            cache_key,
+            settings.LLM_CONVERSATION_ARCHIVE_HOURS * 3600,
+            json.dumps(messages),
+        )
+
+        return messages
 
     async def build_prompt_context(
         self, conversation_id: int, model_max_tokens: int = 4096
@@ -263,6 +409,5 @@ class ConversationManager:
         return [summary_message] + recent_messages
 
     def _estimate_tokens(self, messages: list[dict]) -> int:
-        """估算消息列表的 Token 数（粗略：中文约 2 字符/token）。"""
-        total_chars = sum(len(msg["content"]) for msg in messages)
-        return total_chars // 2
+        """使用 TokenCounter 精确计算消息列表的 Token 数。"""
+        return self._token_counter.count_messages(messages)

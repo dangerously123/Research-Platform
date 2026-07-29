@@ -241,6 +241,40 @@ class PromptTemplateEngine:
         token_count = len(rendered) // 2  # 粗略估算
         return rendered, token_count
 
+    async def get_system_prompt(self, template_id: int | None = None) -> str:
+        """
+        获取系统 Prompt 的基础文本（不含用户变量填充）。
+        用于预算分配器中计算固定组件占用。
+
+        Returns:
+            模板中的系统指令部分（将变量占位符清除后的结果）
+        """
+        if template_id:
+            stmt = select(PromptTemplate).where(
+                PromptTemplate.id == template_id,
+                PromptTemplate.is_active == True,
+            )
+            result = await self.db.execute(stmt)
+            template = result.scalar_one_or_none()
+            if template:
+                return self._extract_system_instruction(template.template_content)
+
+        return self._extract_system_instruction(self.DEFAULT_TEMPLATE)
+
+    def _extract_system_instruction(self, template: str) -> str:
+        """
+        从模板中提取系统指令部分。
+        移除所有变量占位符和条件块，保留纯指令文本。
+        """
+        result = template
+        # 移除条件块
+        result = re.sub(r"{{% if \w+ %}}.*?{{% endif %}}", "", result, flags=re.DOTALL)
+        # 移除变量占位符
+        result = re.sub(r"\{\{\w+\}\}", "", result)
+        # 清理多余空行
+        result = re.sub(r"\n{3,}", "\n\n", result)
+        return result.strip()
+
     def _substitute_variables(self, template: str, variables: dict[str, str]) -> str:
         """替换模板中的变量占位符 {{variable_name}}。"""
         result = template

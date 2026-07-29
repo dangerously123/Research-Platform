@@ -59,6 +59,7 @@ async def add_model(
         endpoint_url=request.endpoint_url,
         api_key_ref=request.api_key,
         priority=request.priority,
+        context_window=request.context_window,
         max_tokens=request.max_tokens,
         temperature=request.temperature,
         task_types=request.task_types,

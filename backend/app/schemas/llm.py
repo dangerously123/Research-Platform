@@ -133,6 +133,7 @@ class AddModelRequest(BaseModel):
     endpoint_url: str
     api_key: str | None = None
     priority: int = 0
+    context_window: int = Field(default=8192, description="模型上下文窗口大小（总 Token 数）")
     max_tokens: int = 4096
     temperature: float = 0.7
     task_types: list[str] | None = None

@@ -4,13 +4,15 @@ import json
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import redis.asyncio as aioredis
 
 from app.core.database import get_db
-from app.core.errors import LLM_001, LLM_005, AppException, NotFoundException
+from app.core.errors import LLM_001, LLM_005, LLM_009, AppException, NotFoundException
 from app.core.redis import get_redis
+from app.models.llm import LLMModelConfig
 from app.schemas.llm import (
     ConversationHistoryResponse,
     ConversationResponse,
@@ -20,6 +22,7 @@ from app.schemas.llm import (
 )
 from app.services.auth.dependencies import get_current_user
 from app.services.llm.adapters.base import AllModelsUnavailableException, LLMRequest
+from app.services.llm.budget_allocator import InputTooLongException
 from app.services.llm.conversation import ConversationManager
 from app.services.llm.gateway import LLMGateway
 from app.services.llm.prompt_engine import PromptTemplateEngine
@@ -27,6 +30,18 @@ from app.services.llm.security import LLMSecurityFilter
 from app.services.llm.token_monitor import TokenMonitorService
 
 router = APIRouter()
+
+
+async def _get_primary_model_config(db: AsyncSession) -> LLMModelConfig | None:
+    """获取当前优先级最高的活跃模型配置。"""
+    stmt = (
+        select(LLMModelConfig)
+        .where(LLMModelConfig.status == "active")
+        .order_by(LLMModelConfig.priority)
+        .limit(1)
+    )
+    result = await db.execute(stmt)
+    return result.scalar_one_or_none()
 
 
 @router.post("", response_model=ConversationResponse, status_code=201)
@@ -83,7 +98,13 @@ async def send_message(
     # 保存用户消息
     await manager.add_message(conversation_id, role="user", content=request.content)
 
-    # 构建上下文（含长期记忆检索）
+    # ===== 获取模型配置（用于预算分配）=====
+    model_config = await _get_primary_model_config(db)
+    model_context_window = model_config.context_window if model_config else 8192
+    model_max_tokens = model_config.max_tokens if model_config else 4096
+    model_provider = model_config.provider if model_config else "openai"
+
+    # 构建上下文（含长期记忆检索）— 保留旧接口用于意图识别
     context_messages, memory_context = await manager.build_prompt_context_with_memory(
         conversation_id=conversation_id,
         user_id=user_id,
@@ -126,21 +147,35 @@ async def send_message(
 
     # 构建 Prompt 附加指令
     extra_instructions = "\n".join(plan.prompt_additions) if plan.prompt_additions else ""
+    if extra_instructions:
+        tools_prompt = tools_prompt + "\n" + extra_instructions if tools_prompt else extra_instructions
 
-    # 匹配 Prompt 模板并渲染
+    # ===== 使用预算分配器构建 Prompt =====
+    # 获取系统 Prompt 模板
     prompt_engine = PromptTemplateEngine(db=db)
     template_id = await prompt_engine.match_template(request.content)
-    prompt = await prompt_engine.render(template_id, {
-        "user_query": plan.intent_result.rewritten_query or request.content,
-        "context_docs": "" if not plan.should_use_rag else "",
-        "memory_context": memory_context,
-        "tools_prompt": tools_prompt + ("\n" + extra_instructions if extra_instructions else ""),
-        "conversation_history": "\n".join(
-            f"{'用户' if m['role'] == 'user' else '助手'}: {m['content']}"
-            for m in context_messages[-10:]
-        ),
-        "current_time": "",
-    })
+    system_prompt = await prompt_engine.get_system_prompt(template_id)
+
+    # 通过预算分配器统一裁剪
+    try:
+        budget_result = await manager.build_prompt_with_budget(
+            conversation_id=conversation_id,
+            user_id=user_id,
+            current_query=plan.intent_result.rewritten_query or request.content,
+            system_prompt=system_prompt,
+            model_context_window=model_context_window,
+            max_output_tokens=model_max_tokens,
+            provider=model_provider,
+            tools_prompt=tools_prompt,
+            rag_docs="" if not plan.should_use_rag else "",
+        )
+        prompt = budget_result.assemble_prompt()
+    except InputTooLongException as e:
+        raise AppException(
+            LLM_009,
+            status_code=400,
+            detail=str(e),
+        )
 
     # ===== 判断是否使用 ReAct 循环 =====
     from app.services.llm.intent.resolver import ExecutionPath

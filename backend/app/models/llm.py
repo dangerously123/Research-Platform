@@ -210,6 +210,9 @@ class LLMModelConfig(Base):
     endpoint_url: Mapped[str] = mapped_column(String(512), nullable=False)
     api_key_ref: Mapped[str | None] = mapped_column(String(256), comment="KMS 中的密钥引用")
     priority: Mapped[int] = mapped_column(Integer, default=0, comment="优先级，数值越小优先级越高")
+    context_window: Mapped[int] = mapped_column(
+        Integer, default=8192, comment="模型上下文窗口大小（总 Token 数）"
+    )
     max_tokens: Mapped[int] = mapped_column(Integer, default=4096)
     temperature: Mapped[float] = mapped_column(Float, default=0.7)
     task_types: Mapped[dict | None] = mapped_column(JSON, comment="适用的任务类型列表")
