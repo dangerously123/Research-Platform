@@ -73,6 +73,11 @@ DEFAULT_POLICIES: dict[str, ComponentPolicy] = {
         min_ratio=0.0, max_ratio=1.0,
         compressible=False,
     ),
+    "file_context": ComponentPolicy(
+        priority=1,
+        min_ratio=0.05, max_ratio=0.40,
+        compressible=True, truncate_from="end",
+    ),
     "recent_history": ComponentPolicy(
         priority=ComponentPriority.RECENT_HISTORY,
         min_ratio=0.05, max_ratio=0.30,
@@ -134,6 +139,7 @@ class AllocationResult:
         order = [
             "system_prompt",
             "tools_prompt",
+            "file_context",
             "memory_context",
             "rag_docs",
             "older_history",

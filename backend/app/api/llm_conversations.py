@@ -13,6 +13,7 @@ from app.core.database import get_db
 from app.core.errors import LLM_001, LLM_005, LLM_009, AppException, NotFoundException
 from app.core.redis import get_redis
 from app.models.llm import LLMModelConfig
+from app.models.file import UploadedFile
 from app.schemas.llm import (
     ConversationHistoryResponse,
     ConversationResponse,
@@ -42,6 +43,48 @@ async def _get_primary_model_config(db: AsyncSession) -> LLMModelConfig | None:
     )
     result = await db.execute(stmt)
     return result.scalar_one_or_none()
+
+
+async def _load_file_context(db: AsyncSession, user_id: int, file_ids: list[int]) -> str:
+    """
+    加载文件提取内容，组装为 Agent 可用的上下文文本。
+
+    Args:
+        db: 数据库会话
+        user_id: 用户ID（验证归属）
+        file_ids: 文件ID列表
+
+    Returns:
+        组装后的文件上下文文本
+    """
+    if not file_ids:
+        return ""
+
+    stmt = select(UploadedFile).where(
+        UploadedFile.id.in_(file_ids),
+        UploadedFile.user_id == user_id,
+        UploadedFile.process_status == "completed",
+    )
+    result = await db.execute(stmt)
+    files = result.scalars().all()
+
+    if not files:
+        return ""
+
+    context_parts = []
+    for f in files:
+        parts = [f"--- 文件: {f.original_name} ({f.file_type}) ---"]
+
+        if f.image_description:
+            parts.append(f"[图片描述]: {f.image_description}")
+        if f.ocr_text:
+            parts.append(f"[图片文字]: {f.ocr_text}")
+        if f.extracted_content:
+            parts.append(f"[文件内容]: {f.extracted_content}")
+
+        context_parts.append("\n".join(parts))
+
+    return "\n\n".join(context_parts)
 
 
 @router.post("", response_model=ConversationResponse, status_code=201)
@@ -156,6 +199,11 @@ async def send_message(
     template_id = await prompt_engine.match_template(request.content)
     system_prompt = await prompt_engine.get_system_prompt(template_id)
 
+    # 加载关联文件的提取内容
+    file_context = ""
+    if request.file_ids:
+        file_context = await _load_file_context(db, user_id, request.file_ids)
+
     # 通过预算分配器统一裁剪
     try:
         budget_result = await manager.build_prompt_with_budget(
@@ -168,6 +216,7 @@ async def send_message(
             provider=model_provider,
             tools_prompt=tools_prompt,
             rag_docs="" if not plan.should_use_rag else "",
+            file_context=file_context,
         )
         prompt = budget_result.assemble_prompt()
     except InputTooLongException as e:

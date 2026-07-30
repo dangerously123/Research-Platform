@@ -1,18 +1,21 @@
-"""工具系统初始化：注册所有工具到全局注册中心。"""
+"""
+工具系统初始化：自动扫描并注册所有工具。
 
-from app.services.llm.tools.math_tools import register_math_tools
-from app.services.llm.tools.geo_tools import register_geo_tools
-from app.services.llm.tools.datetime_tools import register_datetime_tools
-from app.services.llm.tools.text_tools import register_text_tools
+使用 @tool 装饰器的模块会在导入时自动注册到 tool_registry，
+本模块负责触发导入（自动发现）并输出注册摘要。
+"""
+
+from app.services.llm.tools.decorator import auto_discover_tools, get_all_tool_metadata
 from app.services.llm.tools.registry import tool_registry
 
 
 def setup_all_tools():
-    """注册所有工具。应用启动时调用一次。"""
-    register_math_tools()
-    register_geo_tools()
-    register_datetime_tools()
-    register_text_tools()
+    """
+    自动扫描 tools 目录下所有 *_tools.py 模块，
+    触发 @tool 装饰器完成注册。应用启动时调用一次。
+    """
+    # 自动发现并导入所有工具模块
+    auto_discover_tools("app.services.llm.tools")
 
     # 输出注册信息
     tools = tool_registry.list_all()

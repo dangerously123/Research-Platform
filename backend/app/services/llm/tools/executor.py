@@ -37,7 +37,6 @@ class ToolExecutor:
         result_text = text
 
         for tool_name, params_str in calls:
-            # 执行工具
             result = await self._execute_single(tool_name, params_str)
             results_log.append({
                 "tool": tool_name,
@@ -45,7 +44,6 @@ class ToolExecutor:
                 "result": result,
             })
 
-            # 替换原文中的工具调用为结果
             original_call = f"[TOOL_CALL: {tool_name}({params_str})]"
             formatted_result = self._format_result(tool_name, result)
             result_text = result_text.replace(original_call, formatted_result)
@@ -89,34 +87,23 @@ class ToolExecutor:
         if not params_str:
             return {}
 
-        # 尝试解析为 Python kwargs 格式: key1=val1, key2=val2
         try:
-            # 构造一个 dict 字面量来安全解析
-            # "expression='2+3', numbers=[1,2,3]" → {"expression": "2+3", "numbers": [1,2,3]}
-            fake_call = f"dict({params_str})"
-            result = ast.literal_eval(
-                fake_call.replace("dict(", "{").rstrip(")")  + "}"
-                if "=" not in params_str
-                else self._kwargs_to_dict_str(params_str)
-            )
-            return result
+            result = self._kwargs_to_dict(params_str)
+            if result:
+                return result
         except Exception:
             pass
 
-        # 备用方案：尝试 JSON 格式
         try:
             return json.loads(f"{{{params_str}}}")
         except Exception:
             pass
 
-        # 最终备用：简单的 key=value 逐个解析
         return self._manual_parse(params_str)
 
-    def _kwargs_to_dict_str(self, params_str: str) -> str:
-        """将 kwargs 字符串转为可 eval 的 dict 字符串。"""
-        # 这里用安全方式解析
+    def _kwargs_to_dict(self, params_str: str) -> dict:
+        """将 kwargs 字符串解析为 dict。"""
         result = {}
-        # 分割参数（处理嵌套逗号）
         parts = self._split_params(params_str)
         for part in parts:
             if "=" in part:
@@ -127,7 +114,7 @@ class ToolExecutor:
                     result[key] = ast.literal_eval(val)
                 except (ValueError, SyntaxError):
                     result[key] = val.strip("'\"")
-        return json.dumps(result)
+        return result
 
     def _split_params(self, s: str) -> list[str]:
         """智能分割参数，处理括号和引号内的逗号。"""
@@ -170,7 +157,6 @@ class ToolExecutor:
                 key, val = part.split("=", 1)
                 key = key.strip()
                 val = val.strip().strip("'\"")
-                # 尝试转数字
                 try:
                     val = int(val)
                 except ValueError:
@@ -186,9 +172,7 @@ class ToolExecutor:
         if "error" in result and result["error"]:
             return f"[工具 {tool_name} 执行失败: {result['error']}]"
 
-        # 移除 error 键
         display = {k: v for k, v in result.items() if k != "error"}
-        # 简洁格式化
         parts = []
         for k, v in display.items():
             if isinstance(v, float):
@@ -205,32 +189,85 @@ class SmartToolRouter:
     """
     智能工具路由器。
 
-    实现两阶段工具调用策略：
-    1. 预执行阶段：对高置信度的简单计算类问题，直接执行工具，
-       将结果注入 Prompt 作为"已知事实"，让 LLM 基于结果生成自然语言回答。
-    2. 后执行阶段：对 LLM 回答中的工具调用进行解析和执行。
+    预执行规则从 @tool 装饰器元数据自动加载，
+    无需在此文件手动维护 if/elif 规则。
 
-    优势：
-    - 预执行避免了 LLM 自行调用格式错误的问题
-    - 结果作为事实注入，LLM 能更好地组织自然语言回答
+    两阶段工具调用策略：
+    1. 预执行阶段：根据装饰器中的 pre_execute_pattern 自动匹配并执行
+    2. 后执行阶段：对 LLM 回答中的工具调用进行解析和执行
     """
 
     def __init__(self):
         from app.services.llm.tools.intent_matcher import intent_matcher
         self.intent_matcher = intent_matcher
         self.executor = ToolExecutor()
+        self._pre_execute_rules: list[dict] | None = None
+
+    def _ensure_rules_loaded(self):
+        """确保预执行规则已从装饰器元数据加载。"""
+        if self._pre_execute_rules is not None:
+            return
+        try:
+            from app.services.llm.tools.decorator import get_pre_execute_rules
+            self._pre_execute_rules = get_pre_execute_rules()
+        except ImportError:
+            self._pre_execute_rules = []
 
     async def pre_execute(self, query: str) -> dict | None:
         """
-        预执行阶段：尝试直接从问题中提取参数并执行工具。
+        预执行阶段：遍历所有工具的 pre_execute 规则，
+        匹配成功则直接执行工具。
 
         Returns:
             {"tool": str, "result": dict, "context_injection": str} 或 None
         """
-        # 尝试高置信度的直接执行
-        result = await self._try_direct_execution(query)
-        if result:
-            return result
+        self._ensure_rules_loaded()
+
+        for rule in self._pre_execute_rules:
+            pattern = rule["pattern"]
+            extractor = rule["extractor"]
+            formatter = rule.get("formatter")
+            tool_name = rule["tool_name"]
+
+            try:
+                match = re.search(pattern, query)
+                if not match:
+                    continue
+
+                # 提取参数
+                params = extractor(match)
+                if not params:
+                    continue
+
+                # 验证是否为纯数学表达式（calculator 特殊处理）
+                if tool_name == "calculator":
+                    expr = params.get("expression", "")
+                    if not re.match(r'^[\d\s\+\-\*\/\.\(\)\^%sqrtlogsincotan]+$', expr.replace(" ", "")):
+                        continue
+
+                # 执行工具
+                result = await self.executor.execute_tool(tool_name, **params)
+                if "error" in result and result["error"]:
+                    continue
+
+                # 格式化上下文注入
+                context_injection = ""
+                if formatter:
+                    try:
+                        context_injection = formatter(result)
+                    except Exception:
+                        context_injection = str(result)
+                else:
+                    context_injection = str(result)
+
+                return {
+                    "tool": tool_name,
+                    "result": result,
+                    "context_injection": context_injection,
+                }
+            except Exception:
+                continue
+
         return None
 
     async def post_execute(self, llm_output: str) -> tuple[str, list[dict]]:
@@ -248,7 +285,6 @@ class SmartToolRouter:
         """
         parts = []
 
-        # 如果有预执行结果，注入为已知事实
         if pre_result:
             parts.append(
                 f"[已知计算结果] 使用工具 {pre_result['tool']} 计算得到：\n"
@@ -256,139 +292,8 @@ class SmartToolRouter:
                 f"请基于此结果用自然语言回答用户问题。"
             )
         else:
-            # 注入相关工具描述
             tools_prompt = self.intent_matcher.get_relevant_tools_prompt(query)
             if tools_prompt:
                 parts.append(tools_prompt)
 
         return "\n".join(parts)
-
-    async def _try_direct_execution(self, query: str) -> dict | None:
-        """
-        尝试直接从问题中提取参数执行工具。
-        只对高置信度、参数可明确提取的场景执行。
-        """
-        # 规则 1：简单数学表达式 "计算 3.14 * 25"
-        math_match = re.search(
-            r"(?:计算|算|求)\s*[:：]?\s*(.+)",
-            query,
-        )
-        if math_match:
-            expr = math_match.group(1).strip()
-            # 检查是否为纯数学表达式
-            if re.match(r'^[\d\s\+\-\*\/\.\(\)\^%sqrtlogsincotan]+$', expr.replace(" ", "")):
-                result = await self.executor.execute_tool("calculator", expression=expr)
-                if "error" not in result or not result["error"]:
-                    return {
-                        "tool": "calculator",
-                        "result": result,
-                        "context_injection": f"{expr} = {result.get('result')}",
-                    }
-
-        # 规则 2：城市距离 "北京到上海多远"
-        city_dist_match = re.search(
-            r"([\u4e00-\u9fff]{2,4})\s*(?:到|离|距|至)\s*([\u4e00-\u9fff]{2,4})\s*(?:多远|距离|几公里|多少公里)",
-            query,
-        )
-        if city_dist_match:
-            city1, city2 = city_dist_match.group(1), city_dist_match.group(2)
-            result = await self.executor.execute_tool("city_distance", city1=city1, city2=city2)
-            if "error" not in result:
-                return {
-                    "tool": "city_distance",
-                    "result": result,
-                    "context_injection": f"{city1}到{city2}的直线距离约为 {result.get('distance_km')} 公里 ({result.get('distance_miles')} 英里)",
-                }
-
-        # 规则 3：当前时间 "现在几点"
-        if re.search(r"(现在|当前|今天).*(几点|时间|日期|星期)", query):
-            result = await self.executor.execute_tool("current_time", timezone_offset=8)
-            return {
-                "tool": "current_time",
-                "result": result,
-                "context_injection": f"当前时间: {result.get('datetime')} ({result.get('weekday')})",
-            }
-
-        # 规则 4：日期差 含两个日期的问题
-        date_match = re.findall(r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})", query)
-        if len(date_match) >= 2 and ("相隔" in query or "间隔" in query or "多少天" in query or "几天" in query):
-            d1 = date_match[0].replace("/", "-")
-            d2 = date_match[1].replace("/", "-")
-            result = await self.executor.execute_tool("date_difference", date1=d1, date2=d2)
-            if "error" not in result:
-                return {
-                    "tool": "date_difference",
-                    "result": result,
-                    "context_injection": f"{d1} 到 {d2} 相隔 {result.get('days')} 天（约 {result.get('weeks')} 周）",
-                }
-
-        # 规则 5：百分比变化 "从1000到1500增长了多少"
-        change_match = re.search(
-            r"从\s*(\d+\.?\d*)\s*(?:到|变为?|增[长加]到|降?[低到])\s*(\d+\.?\d*)",
-            query,
-        )
-        if change_match and ("增" in query or "变" in query or "涨" in query or "降" in query or "跌" in query):
-            old_val = float(change_match.group(1))
-            new_val = float(change_match.group(2))
-            result = await self.executor.execute_tool(
-                "percentage_change", old_value=old_val, new_value=new_val
-            )
-            if "error" not in result or not result.get("error"):
-                return {
-                    "tool": "percentage_change",
-                    "result": result,
-                    "context_injection": f"从 {old_val} 到 {new_val}，{result.get('direction')} {abs(result.get('change_percent', 0))}%",
-                }
-
-        # 规则 6：平均值/求和 含数字列表
-        numbers_in_query = re.findall(r"\d+\.?\d*", query)
-        if len(numbers_in_query) >= 3:
-            nums = [float(n) for n in numbers_in_query]
-            if "平均" in query or "均值" in query:
-                result = await self.executor.execute_tool("mean", numbers=nums)
-                if "error" not in result or not result.get("error"):
-                    return {
-                        "tool": "mean",
-                        "result": result,
-                        "context_injection": f"{nums} 的平均值为 {result.get('mean')}",
-                    }
-            elif "求和" in query or "总和" in query or "加起来" in query:
-                result = await self.executor.execute_tool("sum", numbers=nums)
-                return {
-                    "tool": "sum",
-                    "result": result,
-                    "context_injection": f"{nums} 的总和为 {result.get('sum')}",
-                }
-
-        # 规则 7：单位转换 "100公里等于多少英里"
-        unit_match = re.search(
-            r"(\d+\.?\d*)\s*(公里|千米|英里|公斤|千克|磅|摄氏度|华氏度|GB|MB|TB|万)\s*(?:等于|是|换算|转换).*?(公里|千米|英里|公斤|千克|磅|摄氏度|华氏度|GB|MB|TB|万|元)",
-            query,
-        )
-        if unit_match:
-            value = float(unit_match.group(1))
-            from_u = self._normalize_unit(unit_match.group(2))
-            to_u = self._normalize_unit(unit_match.group(3))
-            if from_u and to_u:
-                result = await self.executor.execute_tool(
-                    "unit_convert", value=value, from_unit=from_u, to_unit=to_u
-                )
-                if "error" not in result:
-                    return {
-                        "tool": "unit_convert",
-                        "result": result,
-                        "context_injection": f"{value} {from_u} = {result.get('result')} {to_u}",
-                    }
-
-        return None
-
-    def _normalize_unit(self, unit_str: str) -> str:
-        """标准化单位名称。"""
-        mapping = {
-            "公里": "km", "千米": "km", "英里": "mile",
-            "公斤": "kg", "千克": "kg", "磅": "lb",
-            "摄氏度": "celsius", "华氏度": "fahrenheit",
-            "GB": "gb", "MB": "mb", "TB": "tb",
-            "万": "wan", "元": "rmb",
-        }
-        return mapping.get(unit_str, unit_str.lower())

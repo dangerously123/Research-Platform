@@ -301,13 +301,17 @@ class IntentClassifier:
         Returns:
             (工具名列表, 提取的参数, 工具匹配置信度)
         """
-        from app.services.llm.tools.intent_matcher import TOOL_TRIGGERS
+        from app.services.llm.tools.intent_matcher import intent_matcher
+
+        # 确保触发规则已加载
+        intent_matcher._ensure_loaded()
+        triggers = intent_matcher._triggers
 
         matched_tools = []
         all_params = {}
         max_score = 0
 
-        for trigger in TOOL_TRIGGERS:
+        for trigger in triggers:
             score = self._score_trigger(query, trigger)
             if score > 0:
                 matched_tools.append(trigger.tool_name)

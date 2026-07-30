@@ -62,6 +62,7 @@ def _register_routers(app: FastAPI):
     from app.api.audit import router as audit_router
     from app.api.memories import router as memories_router
     from app.api.tools import router as tools_router
+    from app.api.files import router as files_router
 
     prefix = settings.API_V1_PREFIX
 
@@ -77,6 +78,7 @@ def _register_routers(app: FastAPI):
     app.include_router(audit_router, prefix=f"{prefix}/audit", tags=["审计日志"])
     app.include_router(memories_router, prefix=f"{prefix}/memories", tags=["记忆管理"])
     app.include_router(tools_router, prefix=f"{prefix}/tools", tags=["工具"])
+    app.include_router(files_router, prefix=f"{prefix}/files", tags=["文件管理"])
 
 
 app = create_app()

@@ -130,6 +130,7 @@ class ConversationManager:
         provider: str = "openai",
         tools_prompt: str = "",
         rag_docs: str = "",
+        file_context: str = "",
     ) -> "AllocationResult":
         """
         使用预算分配器构建完整 Prompt（推荐的新接口）。
@@ -150,6 +151,7 @@ class ConversationManager:
             provider: 模型供应商
             tools_prompt: 工具描述文本
             rag_docs: RAG 检索文档文本
+            file_context: 用户上传文件的提取内容
 
         Returns:
             AllocationResult 包含裁剪后的各组件和统计信息
@@ -188,6 +190,7 @@ class ConversationManager:
         components = {
             "system_prompt": system_prompt,
             "user_query": current_query,
+            "file_context": file_context,
             "recent_history": recent_history,
             "older_history": older_history,
             "memory_context": memory_context,
