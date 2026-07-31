@@ -22,8 +22,8 @@ class ReportGenerateRequest(BaseModel):
     dimensions: list[str] | None = None
     filters: dict | None = None
     chart_type: str = "table"
-    page: int = 1
-    page_size: int = 50
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=50, ge=1, le=10000)
 
 
 class ReportExportRequest(BaseModel):
@@ -62,7 +62,7 @@ async def generate_report(
     db: AsyncSession = Depends(get_db),
     redis: aioredis.Redis = Depends(get_redis),
 ):
-    """生成报表数据。"""
+    """生成报表数据（校验用户对该报表的访问权限）。"""
     # 获取报表配置
     stmt = select(ReportConfig).where(ReportConfig.id == report_id)
     result = await db.execute(stmt)
@@ -71,13 +71,22 @@ async def generate_report(
         from app.core.errors import REPORT_001, NotFoundException
         raise NotFoundException(REPORT_001)
 
+    # 权限校验：确认用户可访问该报表
+    generator = ReportGenerator(db=db)
+    accessible = await generator.get_accessible_reports(
+        current_user.get("roles", [])
+    )
+    accessible_ids = {r.id for r in accessible}
+    if report_id not in accessible_ids:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=403, detail="无权访问该报表")
+
     # 获取用户权限
     calculator = PermissionCalculator(db=db, redis=redis)
     permissions = await calculator.get_effective_permissions(
         current_user["user_id"]
     )
 
-    generator = ReportGenerator(db=db)
     data = await generator.generate(
         report_config=config,
         date_range=request.date_range,
@@ -98,8 +107,17 @@ async def export_report(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """发起报表导出任务。"""
+    """发起报表导出任务（校验用户对该报表的访问权限）。"""
+    # 权限校验
     generator = ReportGenerator(db=db)
+    accessible = await generator.get_accessible_reports(
+        current_user.get("roles", [])
+    )
+    accessible_ids = {r.id for r in accessible}
+    if report_id not in accessible_ids:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=403, detail="无权导出该报表")
+
     task = await generator.create_export_task(
         user_id=current_user["user_id"],
         report_config_id=report_id,
@@ -114,11 +132,18 @@ async def get_export_status(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """查询导出任务状态。"""
+    """查询导出任务状态（校验任务归属）。"""
     generator = ReportGenerator(db=db)
     task = await generator.get_export_task(task_id)
     if not task:
         return {"task_id": task_id, "status": "not_found"}
+
+    # 归属校验
+    if task.user_id != current_user["user_id"]:
+        is_admin = "admin" in current_user.get("roles", [])
+        if not is_admin:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=403, detail="无权查看该导出任务")
 
     return {
         "task_id": task.id,

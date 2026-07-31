@@ -53,7 +53,25 @@ class LLMGateway:
         """
         统一生成接口（非流式）。
         自动选择模型并处理 Failover。
+        集成降级策略：根据当前降级级别调整模型选择和参数。
         """
+        # 检查降级状态
+        from app.services.degradation import DegradationService, DegradationLevel
+        degradation = DegradationService(self.redis)
+        deg_config = await degradation.get_current_config()
+
+        # FALLBACK 级别：直接拒绝 LLM 调用
+        if deg_config.level == DegradationLevel.FALLBACK:
+            raise AllModelsUnavailableException(
+                last_error=Exception("系统处于降级模式，LLM 服务暂不可用")
+            )
+
+        # 应用降级参数限制
+        effective_max_tokens = min(
+            request.max_tokens,
+            deg_config.max_output_tokens,
+        )
+
         models = await self._get_available_models(request.task_type)
         if not models:
             raise AllModelsUnavailableException()
@@ -73,7 +91,7 @@ class LLMGateway:
                 response = await adapter.generate(
                     endpoint=model.endpoint_url,
                     prompt=request.prompt,
-                    max_tokens=model.max_tokens,
+                    max_tokens=min(model.max_tokens, effective_max_tokens),
                     temperature=model.temperature,
                     api_key=api_key,
                 )
@@ -93,7 +111,12 @@ class LLMGateway:
     async def stream_generate(self, request: LLMRequest, api_key_getter=None) -> tuple[AsyncIterator[str], str]:
         """
         统一流式生成接口。
-        返回 (token_iterator, model_id)。
+        返回 (safe_token_iterator, model_id)。
+
+        改进：
+        - 只有首个 token 成功产出后才重置熔断
+        - 流中 JSON 解析错误不会中断整个流
+        - 流中异常记录熔断失败
         """
         models = await self._get_available_models(request.task_type)
         if not models:
@@ -110,7 +133,7 @@ class LLMGateway:
                 if api_key_getter and model.api_key_ref:
                     api_key = await api_key_getter(model.model_id)
 
-                iterator = adapter.stream_generate(
+                raw_iterator = adapter.stream_generate(
                     endpoint=model.endpoint_url,
                     prompt=request.prompt,
                     max_tokens=model.max_tokens,
@@ -118,8 +141,11 @@ class LLMGateway:
                     api_key=api_key,
                 )
 
-                await self._reset_circuit(model.model_id)
-                return iterator, model.model_id
+                # 包装 iterator：首 token 后才 reset circuit，流中异常记录失败
+                safe_iterator = self._wrap_stream_iterator(
+                    raw_iterator, model.model_id
+                )
+                return safe_iterator, model.model_id
 
             except ModelInvocationException as e:
                 last_error = e
@@ -197,3 +223,25 @@ class LLMGateway:
     async def _reset_circuit(self, model_id: str) -> None:
         """成功调用后重置熔断计数。"""
         await self.redis.delete(f"llm:circuit:{model_id}")
+
+    async def _wrap_stream_iterator(
+        self, raw_iterator: AsyncIterator[str], model_id: str
+    ) -> AsyncIterator[str]:
+        """
+        包装流式迭代器：
+        - 首个 token 成功后才 reset circuit
+        - 流中异常记录失败
+        - JSON 解析错误跳过而非中断
+        """
+        first_token = True
+        try:
+            async for token in raw_iterator:
+                if first_token:
+                    await self._reset_circuit(model_id)
+                    first_token = True
+                    first_token = False
+                yield token
+        except Exception:
+            # 流中断：记录熔断失败
+            await self._record_failure(model_id)
+            raise

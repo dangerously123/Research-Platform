@@ -7,10 +7,15 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
 from app.core.errors import AppException, app_exception_handler
+from app.core.logging import setup_logging
+from app.core.middleware import TimingMiddleware, TraceMiddleware
 from app.core.redis import close_redis
 
 # 启动时注册所有 LLM 工具
 import app.services.llm.tools.setup  # noqa: F401
+
+# 初始化结构化日志
+setup_logging()
 
 
 @asynccontextmanager
@@ -30,10 +35,15 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # CORS 中间件
+    # 中间件（注意顺序：先注册的后执行，Trace 应最外层）
+    app.add_middleware(TimingMiddleware)
+    app.add_middleware(TraceMiddleware)
+
+    # CORS（生产环境使用白名单）
+    from app.core.security import get_cors_origins
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # 生产环境应限制
+        allow_origins=get_cors_origins(),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -42,43 +52,11 @@ def create_app() -> FastAPI:
     # 注册全局异常处理器
     app.add_exception_handler(AppException, app_exception_handler)
 
-    # 注册路由
-    _register_routers(app)
+    # 注册路由（聚合在 api/__init__.py 中）
+    from app.api import api_router
+    app.include_router(api_router)
 
     return app
-
-
-def _register_routers(app: FastAPI):
-    """注册所有 API 路由。"""
-    from app.api.auth import router as auth_router
-    from app.api.roles import router as roles_router
-    from app.api.permissions import router as permissions_router
-    from app.api.knowledge import router as knowledge_router
-    from app.api.reports import router as reports_router
-    from app.api.llm_conversations import router as llm_conversations_router
-    from app.api.llm_models import router as llm_models_router
-    from app.api.prompts import router as prompts_router
-    from app.api.tokens import router as tokens_router
-    from app.api.audit import router as audit_router
-    from app.api.memories import router as memories_router
-    from app.api.tools import router as tools_router
-    from app.api.files import router as files_router
-
-    prefix = settings.API_V1_PREFIX
-
-    app.include_router(auth_router, prefix=f"{prefix}/auth", tags=["认证"])
-    app.include_router(roles_router, prefix=f"{prefix}/roles", tags=["角色管理"])
-    app.include_router(permissions_router, prefix=f"{prefix}/users", tags=["权限管理"])
-    app.include_router(knowledge_router, prefix=f"{prefix}/knowledge", tags=["知识检索"])
-    app.include_router(reports_router, prefix=f"{prefix}/reports", tags=["数据报表"])
-    app.include_router(llm_conversations_router, prefix=f"{prefix}/llm/conversations", tags=["LLM对话"])
-    app.include_router(llm_models_router, prefix=f"{prefix}/llm/models", tags=["LLM模型管理"])
-    app.include_router(prompts_router, prefix=f"{prefix}/prompts/templates", tags=["Prompt模板"])
-    app.include_router(tokens_router, prefix=f"{prefix}/tokens", tags=["Token监控"])
-    app.include_router(audit_router, prefix=f"{prefix}/audit", tags=["审计日志"])
-    app.include_router(memories_router, prefix=f"{prefix}/memories", tags=["记忆管理"])
-    app.include_router(tools_router, prefix=f"{prefix}/tools", tags=["工具"])
-    app.include_router(files_router, prefix=f"{prefix}/files", tags=["文件管理"])
 
 
 app = create_app()

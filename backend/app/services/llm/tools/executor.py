@@ -6,12 +6,14 @@ import re
 from typing import Any
 
 from app.services.llm.tools.registry import tool_registry
+from app.services.llm.tools.permission import tool_permission_manager
 
 
 class ToolExecutor:
     """
     工具执行器。
     - 解析 LLM 输出中的 [TOOL_CALL: ...] 格式
+    - 权限检查（安全等级、角色、黑名单）
     - 执行对应工具
     - 将结果格式化后返回
     - 支持多轮工具调用（LLM 可在一次回答中调多个工具）
@@ -21,6 +23,13 @@ class ToolExecutor:
     TOOL_CALL_PATTERN = re.compile(
         r"\[TOOL_CALL:\s*(\w+)\((.*?)\)\]", re.DOTALL
     )
+
+    def __init__(self, user_roles: list[str] | None = None):
+        """
+        Args:
+            user_roles: 当前用户角色列表（用于权限检查，None 则跳过权限）
+        """
+        self._user_roles = user_roles
 
     async def execute_from_text(self, text: str) -> tuple[str, list[dict]]:
         """
@@ -51,7 +60,21 @@ class ToolExecutor:
         return result_text, results_log
 
     async def execute_tool(self, tool_name: str, **kwargs) -> dict[str, Any]:
-        """直接执行指定工具。"""
+        """直接执行指定工具（含权限检查）。"""
+        # 权限检查
+        if self._user_roles is not None:
+            perm = tool_permission_manager.check_permission(
+                tool_name, self._user_roles, params=kwargs
+            )
+            if not perm.allowed:
+                return {"error": f"权限不足: {perm.reason}"}
+            if perm.confirmation_required:
+                return {
+                    "error": None,
+                    "confirmation_required": True,
+                    "confirmation_message": perm.confirmation_message,
+                }
+
         tool = tool_registry.get(tool_name)
         if not tool:
             return {"error": f"未知工具: {tool_name}"}
@@ -69,13 +92,22 @@ class ToolExecutor:
     async def _execute_single(
         self, tool_name: str, params_str: str
     ) -> dict[str, Any]:
-        """执行单个工具调用。"""
+        """执行单个工具调用（含权限检查）。"""
         tool = tool_registry.get(tool_name)
         if not tool:
             return {"error": f"未知工具: {tool_name}"}
 
         try:
             params = self._parse_params(params_str)
+
+            # 权限检查
+            if self._user_roles is not None:
+                perm = tool_permission_manager.check_permission(
+                    tool_name, self._user_roles, params=params
+                )
+                if not perm.allowed:
+                    return {"error": f"权限不足: {perm.reason}"}
+
             result = await tool.handler(**params)
             return result
         except Exception as e:

@@ -122,7 +122,12 @@ class SessionManager:
         if not session_data:
             return None
 
-        session = json.loads(session_data)
+        try:
+            session = json.loads(session_data)
+        except (json.JSONDecodeError, TypeError):
+            # 会话数据损坏，视为无效会话
+            await self.redis.delete(session_key)
+            return None
 
         # 检查会话超时（30 分钟无操作）
         last_active = datetime.fromisoformat(session["last_active"])

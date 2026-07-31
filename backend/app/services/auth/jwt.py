@@ -54,3 +54,6 @@ def decode_access_token(token: str) -> dict | None:
         return payload
     except JWTError:
         return None
+    except Exception:
+        # 防止配置错误或非预期异常冒泡到认证之外
+        return None

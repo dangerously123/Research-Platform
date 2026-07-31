@@ -12,7 +12,7 @@ class CreateConversationRequest(BaseModel):
 
 
 class SendMessageRequest(BaseModel):
-    content: str = Field(..., min_length=1)
+    content: str = Field(..., min_length=1, max_length=8000)
     file_ids: list[int] = Field(default_factory=list, description="关联的文件ID列表")
     use_rag: bool = True
     stream: bool = True

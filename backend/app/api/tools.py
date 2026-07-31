@@ -59,7 +59,26 @@ async def execute_tool(
     request: ExecuteToolRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    """手动执行指定工具（用于调试和直接调用）。"""
-    executor = ToolExecutor()
+    """
+    手动执行指定工具（用于调试和直接调用）。
+    已集成权限检查：根据用户角色和工具安全等级决定是否允许执行。
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    user_roles = current_user.get("roles", ["user"])
+    executor = ToolExecutor(user_roles=user_roles)
     result = await executor.execute_tool(request.tool_name, **request.params)
+
+    # 审计日志
+    logger.info(
+        f"[ToolExecute] user={current_user['user_id']} tool={request.tool_name} "
+        f"roles={user_roles} result_has_error={'error' in result and result.get('error')}"
+    )
+
+    # 权限不足时返回 403
+    if result.get("error") and "权限不足" in str(result["error"]):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=403, detail=result["error"])
+
     return {"tool": request.tool_name, "result": result}

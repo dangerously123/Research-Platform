@@ -159,6 +159,8 @@ class ReActAgent:
         query: str,
         context: str = "",
         tools_prompt: str = "",
+        user_id: int = 0,
+        conversation_id: int | None = None,
     ) -> ReActResult:
         """
         执行 ReAct 循环。
@@ -167,6 +169,8 @@ class ReActAgent:
             query: 用户问题
             context: 额外上下文（RAG文档、记忆等）
             tools_prompt: 可用工具描述
+            user_id: 用户ID（用于轨迹记录）
+            conversation_id: 会话ID（用于轨迹记录）
 
         Returns:
             ReActResult 包含最终回答和推理过程
@@ -177,6 +181,19 @@ class ReActAgent:
         total_output_tokens = 0
         model_id = ""
         no_action_count = 0
+
+        # === 初始化轨迹记录 ===
+        from app.services.observability import TraceRecorder
+        recorder = TraceRecorder(self.db)
+        try:
+            await recorder.start_trace(
+                user_id=user_id,
+                query=query,
+                execution_type="react",
+                conversation_id=conversation_id,
+            )
+        except Exception:
+            pass  # 轨迹记录失败不影响主流程
 
         # === 初始化工作记忆 ===
         from app.services.llm.react.working_memory import WorkingMemory
@@ -278,6 +295,23 @@ class ReActAgent:
                 steps.append(step)
                 elapsed = (time.perf_counter() - start_time) * 1000
 
+                # 记录轨迹步骤
+                try:
+                    await recorder.record_step(
+                        iteration=iteration, thought=thought,
+                        is_final=True, input_tokens=response.input_tokens,
+                        output_tokens=response.output_tokens,
+                    )
+                    await recorder.complete_trace(
+                        final_answer=final_answer, exit_reason="final_answer",
+                        model_id=model_id, total_iterations=len(steps),
+                        total_input_tokens=total_input_tokens,
+                        total_output_tokens=total_output_tokens,
+                        quality_score=self._assess_quality(query, steps),
+                    )
+                except Exception:
+                    pass
+
                 # 保存成功的推理链路
                 try:
                     await self.trace_memory.save_successful_trace(
@@ -338,6 +372,24 @@ class ReActAgent:
             step.observation = observation
             steps.append(step)
 
+            # 记录轨迹步骤
+            tool_success = "失败" not in observation and "错误" not in observation
+            step_duration = (time.perf_counter() - start_time) * 1000 - sum(
+                s.duration_ms for s in steps[:-1] if hasattr(s, 'duration_ms') and s.duration_ms
+            ) if False else 0
+            try:
+                await recorder.record_step(
+                    iteration=iteration, thought=thought,
+                    action=action_name, action_input=action_params,
+                    observation=observation[:500],
+                    input_tokens=response.input_tokens,
+                    output_tokens=response.output_tokens,
+                    tool_success=tool_success,
+                    tool_error=observation if not tool_success else None,
+                )
+            except Exception:
+                pass
+
             # ④ 记录到工作记忆
             working_mem.record_step(
                 iteration=iteration,
@@ -391,6 +443,18 @@ class ReActAgent:
         # 达到最大轮数 → 保存推理链路后返回
         elapsed = (time.perf_counter() - start_time) * 1000
         answer = self._extract_best_answer(steps)
+
+        # 记录轨迹完成
+        try:
+            await recorder.complete_trace(
+                final_answer=answer, exit_reason="max_iter",
+                model_id=model_id, total_iterations=len(steps),
+                total_input_tokens=total_input_tokens,
+                total_output_tokens=total_output_tokens,
+                quality_score=self._assess_quality(query, steps),
+            )
+        except Exception:
+            pass
 
         # 保存成功的推理链路到记忆
         try:

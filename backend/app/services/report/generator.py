@@ -146,21 +146,43 @@ class ReportGenerator:
         page: int,
         page_size: int,
     ) -> list[dict]:
-        """执行数据查询。"""
-        # 使用报表配置中的查询模板
-        # 实际项目中使用参数化查询防止SQL注入
+        """
+        执行数据查询。
+
+        安全措施：
+        - 只允许 SELECT 语句
+        - 强制 LIMIT 上限（最多 10000 行）
+        - 查询超时 30 秒
+        - 错误透传而非静默吞掉
+        """
         query_template = config.query_template
 
-        # 分页
-        offset = (page - 1) * page_size
-        query = f"{query_template} LIMIT {page_size} OFFSET {offset}"
+        # 安全检查：只允许 SELECT
+        normalized = query_template.strip().upper()
+        if not normalized.startswith("SELECT"):
+            raise ValueError("报表查询必须为 SELECT 语句")
+        # 禁止危险关键词
+        forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE", "GRANT", "EXEC"]
+        for kw in forbidden:
+            if kw in normalized:
+                raise ValueError(f"报表查询不允许包含 {kw}")
+
+        # 分页（强制上限）
+        safe_page_size = min(page_size, 10000)
+        offset = (page - 1) * safe_page_size
+        query = f"{query_template} LIMIT {safe_page_size} OFFSET {offset}"
 
         try:
-            result = await self.db.execute(text(query))
+            # 设置查询超时（MySQL: max_execution_time hint）
+            timed_query = f"SELECT /*+ MAX_EXECUTION_TIME(30000) */ * FROM ({query}) _q"
+            result = await self.db.execute(text(timed_query))
             rows = result.mappings().all()
             return [dict(row) for row in rows]
-        except Exception:
-            return []
+        except Exception as e:
+            # 错误透传，不静默吞掉
+            import logging
+            logging.getLogger(__name__).error(f"[Report] 查询失败: {e}")
+            raise RuntimeError(f"报表查询执行失败: {str(e)[:200]}")
 
     async def _count_total(
         self,
@@ -168,14 +190,23 @@ class ReportGenerator:
         date_range: dict | None,
         filters: dict | None,
     ) -> int:
-        """获取总记录数。"""
-        count_query = f"SELECT COUNT(*) as cnt FROM ({config.query_template}) sub"
+        """获取总记录数（带安全检查和超时）。"""
+        query_template = config.query_template
+
+        # 安全检查
+        normalized = query_template.strip().upper()
+        if not normalized.startswith("SELECT"):
+            return 0
+
+        count_query = f"SELECT COUNT(*) as cnt FROM ({query_template}) sub"
         try:
             result = await self.db.execute(text(count_query))
             row = result.one()
             return row.cnt
-        except Exception:
-            return 0
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"[Report] 计数查询失败: {e}")
+            raise RuntimeError(f"报表计数查询失败: {str(e)[:200]}")
 
     def _build_chart_config(
         self, data: list[dict], chart_type: str

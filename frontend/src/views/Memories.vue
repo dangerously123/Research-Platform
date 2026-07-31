@@ -2,7 +2,8 @@
   <div class="memories-page">
     <div class="header-row">
       <h3>我的记忆</h3>
-      <el-button type="danger" plain @click="handleClearAll" :disabled="!memories.length">
+      <el-button type="danger" plain @click="handleClearAll"
+        :disabled="!memories.length || clearing" :loading="clearing">
         清空全部
       </el-button>
     </div>
@@ -48,7 +49,11 @@
         <template #header>
           <div class="card-header">
             <span class="memory-question">{{ mem.question }}</span>
-            <el-button text type="danger" size="small" @click="handleDelete(mem.id)">删除</el-button>
+            <el-button text type="danger" size="small"
+              :loading="deletingIds.has(mem.id)" :disabled="deletingIds.has(mem.id)"
+              @click="handleDelete(mem.id)">
+              删除
+            </el-button>
           </div>
         </template>
         <div class="memory-answer">{{ mem.answer_summary }}</div>
@@ -77,7 +82,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, reactive, onMounted } from 'vue'
 import api from '@/utils/api'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
@@ -90,6 +95,8 @@ const topicFilter = ref('')
 const searchQuery = ref('')
 const searchResults = ref<any[]>([])
 const searching = ref(false)
+const clearing = ref(false)
+const deletingIds = reactive(new Set<number>())
 
 onMounted(loadMemories)
 
@@ -112,10 +119,14 @@ async function doSearch() {
     searchResults.value = []
     return
   }
+  if (searching.value) return
   searching.value = true
   try {
     const res = await api.post('/memories/search', { query: searchQuery.value, top_k: 5 })
     searchResults.value = res.data.results
+  } catch {
+    searchResults.value = []
+    ElMessage.error('搜索失败')
   } finally {
     searching.value = false
   }
@@ -127,18 +138,34 @@ function changePage(p: number) {
 }
 
 async function handleDelete(memoryId: number) {
+  if (deletingIds.has(memoryId)) return
   await ElMessageBox.confirm('确定删除这条记忆？删除后不可恢复。')
-  await api.delete(`/memories/${memoryId}`)
-  ElMessage.success('已删除')
-  loadMemories()
+  deletingIds.add(memoryId)
+  try {
+    await api.delete(`/memories/${memoryId}`)
+    ElMessage.success('已删除')
+    loadMemories()
+  } catch {
+    ElMessage.error('删除失败')
+  } finally {
+    deletingIds.delete(memoryId)
+  }
 }
 
 async function handleClearAll() {
+  if (clearing.value) return
   await ElMessageBox.confirm('确定清空所有记忆？此操作不可撤销！', '警告', { type: 'warning' })
-  await api.delete('/memories')
-  ElMessage.success('已清空所有记忆')
-  memories.value = []
-  total.value = 0
+  clearing.value = true
+  try {
+    await api.delete('/memories')
+    ElMessage.success('已清空所有记忆')
+    memories.value = []
+    total.value = 0
+  } catch {
+    ElMessage.error('清空失败')
+  } finally {
+    clearing.value = false
+  }
 }
 
 function formatDate(dateStr: string) {

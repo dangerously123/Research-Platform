@@ -4,13 +4,17 @@
     <div class="search-bar">
       <el-input v-model="query" placeholder="输入自然语言问题..." @keydown.enter="doSearch" clearable />
       <el-switch v-model="useLLM" active-text="LLM回答" inactive-text="仅检索" />
-      <el-button type="primary" @click="doSearch" :loading="loading">搜索</el-button>
+      <el-button type="primary" @click="doSearch" :loading="loading" :disabled="loading">搜索</el-button>
     </div>
+
+    <!-- 错误提示 -->
+    <el-alert v-if="errorMsg" :title="errorMsg" type="error" closable
+      @close="errorMsg = ''" style="margin-bottom:12px" />
 
     <div v-if="result" class="result-area">
       <div v-if="result.answer" class="answer-box">
         <h4>AI 回答</h4>
-        <div v-html="result.answer.replace(/\n/g, '<br>')" class="answer-content"></div>
+        <div class="answer-content" v-html="escapeHtml(result.answer)"></div>
         <el-tag v-if="result.degraded" type="warning">LLM不可用，以下为原始检索结果</el-tag>
       </div>
 
@@ -37,11 +41,13 @@ const query = ref('')
 const useLLM = ref(true)
 const loading = ref(false)
 const result = ref<any>(null)
+const errorMsg = ref('')
 
 async function doSearch() {
-  if (!query.value.trim()) return
+  if (!query.value.trim() || loading.value) return
   loading.value = true
   result.value = null
+  errorMsg.value = ''
   try {
     const res = await api.post('/knowledge/search', {
       query: query.value,
@@ -49,9 +55,21 @@ async function doSearch() {
       use_llm: useLLM.value,
     })
     result.value = res.data
+  } catch {
+    errorMsg.value = '搜索失败，请稍后重试'
   } finally {
     loading.value = false
   }
+}
+
+function escapeHtml(text: string): string {
+  if (!text) return ''
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/\n/g, '<br>')
 }
 </script>
 

@@ -1,0 +1,102 @@
+# 工具调用评测数据集
+# 每条用例包含：query, expected_tool, expected_params, result_value/result_contains
+
+# ===== 数学类 =====
+- id: math_calc_01
+  query: "计算 256 * 1024"
+  expected_tool: calculator
+  expected_params: {expression: "256 * 1024"}
+  result_value: 262144
+  category: math
+  tags: [arithmetic, simple]
+
+- id: math_calc_02
+  query: "算一下 sqrt(144) + 2 的 3 次方"
+  expected_tool: calculator
+  expected_params: {expression: "sqrt(144) + 2**3"}
+  result_value: 20.0
+  category: math
+  tags: [arithmetic, function]
+
+- id: math_mean_01
+  query: "85, 92, 78, 90, 88 的平均分是多少"
+  expected_tool: mean
+  expected_params: {numbers: [85, 92, 78, 90, 88]}
+  result_value: 86.6
+  category: math
+  tags: [statistics]
+
+- id: math_change_01
+  query: "从 1000 到 1500 增长了多少百分比"
+  expected_tool: percentage_change
+  expected_params: {old_value: 1000, new_value: 1500}
+  result_value: 50.0
+  category: math
+  tags: [percentage]
+
+- id: math_change_02
+  query: "营收从200万下降到150万，降幅是多少"
+  expected_tool: percentage_change
+  expected_params: {old_value: 200, new_value: 150}
+  result_value: -25.0
+  category: math
+  tags: [percentage]
+
+# ===== 地理类 =====
+- id: geo_dist_01
+  query: "北京到上海有多远"
+  expected_tool: city_distance
+  expected_params: {city1: "北京", city2: "上海"}
+  result_contains: "distance_km"
+  category: geo
+  tags: [distance]
+
+- id: geo_dist_02
+  query: "深圳离广州多少公里"
+  expected_tool: city_distance
+  expected_params: {city1: "深圳", city2: "广州"}
+  result_contains: "distance_km"
+  category: geo
+  tags: [distance]
+
+# ===== 时间类 =====
+- id: time_diff_01
+  query: "2024-01-01 到 2024-12-31 相隔多少天"
+  expected_tool: date_difference
+  expected_params: {date1: "2024-01-01", date2: "2024-12-31"}
+  result_value: 365
+  category: datetime
+  tags: [date_diff]
+
+- id: time_now_01
+  query: "现在几点了"
+  expected_tool: current_time
+  expected_params: {timezone_offset: 8}
+  result_contains: "datetime"
+  category: datetime
+  tags: [current_time]
+
+- id: time_add_01
+  query: "2024-03-01 之后 90 天是什么日期"
+  expected_tool: add_days
+  expected_params: {date: "2024-03-01", days: 90}
+  result_contains: "result_date"
+  category: datetime
+  tags: [date_add]
+
+# ===== 文本/单位类 =====
+- id: unit_01
+  query: "100公里等于多少英里"
+  expected_tool: unit_convert
+  expected_params: {value: 100, from_unit: "km", to_unit: "mile"}
+  result_value: 62.1371
+  category: text
+  tags: [unit_convert]
+
+- id: hash_01
+  query: "hello 的 MD5 值是什么"
+  expected_tool: hash_text
+  expected_params: {text: "hello", algorithm: "md5"}
+  result_contains: "5d41402abc4b2a76b9719d911017c592"
+  category: text
+  tags: [hash]

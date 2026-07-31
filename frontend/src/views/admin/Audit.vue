@@ -12,11 +12,17 @@
         </el-select>
       </el-form-item>
       <el-form-item>
-        <el-button type="primary" @click="loadLogs">查询</el-button>
+        <el-button type="primary" @click="loadLogs" :loading="loading" :disabled="loading">
+          查询
+        </el-button>
       </el-form-item>
     </el-form>
 
-    <el-table :data="logs" border stripe>
+    <!-- 错误提示 -->
+    <el-alert v-if="errorMsg" :title="errorMsg" type="error" closable
+      @close="errorMsg = ''" style="margin-bottom:12px" />
+
+    <el-table :data="logs" border stripe v-loading="loading">
       <el-table-column prop="user_id" label="用户ID" width="80" />
       <el-table-column prop="operation_type" label="操作类型" width="120" />
       <el-table-column prop="resource_type" label="资源类型" width="120" />
@@ -24,6 +30,8 @@
       <el-table-column prop="created_at" label="时间" width="180" />
       <el-table-column prop="data_scope" label="数据范围" />
     </el-table>
+
+    <el-empty v-if="!loading && !logs.length && !errorMsg" description="暂无审计日志" />
   </div>
 </template>
 
@@ -33,13 +41,25 @@ import api from '@/utils/api'
 
 const logs = ref<any[]>([])
 const filters = reactive({ operation_type: '' })
+const loading = ref(false)
+const errorMsg = ref('')
 
 onMounted(loadLogs)
 
 async function loadLogs() {
-  const params: any = {}
-  if (filters.operation_type) params.operation_type = filters.operation_type
-  const res = await api.get('/audit/logs', { params })
-  logs.value = res.data.logs || res.data || []
+  if (loading.value) return
+  loading.value = true
+  errorMsg.value = ''
+  try {
+    const params: any = {}
+    if (filters.operation_type) params.operation_type = filters.operation_type
+    const res = await api.get('/audit/logs', { params })
+    logs.value = res.data.logs || res.data || []
+  } catch {
+    errorMsg.value = '查询审计日志失败'
+    logs.value = []
+  } finally {
+    loading.value = false
+  }
 }
 </script>

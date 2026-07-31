@@ -1,0 +1,76 @@
+# 意图识别评测数据集
+# 每条用例包含：query, needs_tool (bool), expected_tools (可选), category
+
+# ===== 需要工具的问题 =====
+- id: intent_tool_01
+  query: "帮我计算 3.14 * 25"
+  needs_tool: true
+  expected_tools: [calculator]
+  category: math
+
+- id: intent_tool_02
+  query: "北京到广州的距离是多少"
+  needs_tool: true
+  expected_tools: [city_distance]
+  category: geo
+
+- id: intent_tool_03
+  query: "今天星期几"
+  needs_tool: true
+  expected_tools: [current_time]
+  category: datetime
+
+- id: intent_tool_04
+  query: "2023-06-01 和 2024-01-15 之间有多少个工作日"
+  needs_tool: true
+  expected_tools: [workdays_between]
+  category: datetime
+
+- id: intent_tool_05
+  query: "100 85 92 78 的平均值"
+  needs_tool: true
+  expected_tools: [mean]
+  category: math
+
+- id: intent_tool_06
+  query: "从500增长到750，增长率是多少"
+  needs_tool: true
+  expected_tools: [percentage_change]
+  category: math
+
+- id: intent_tool_07
+  query: "50摄氏度等于多少华氏度"
+  needs_tool: true
+  expected_tools: [unit_convert]
+  category: text
+
+# ===== 不需要工具的问题（纯对话/知识类）=====
+- id: intent_no_tool_01
+  query: "你好，介绍一下你自己"
+  needs_tool: false
+  category: chat
+
+- id: intent_no_tool_02
+  query: "什么是机器学习"
+  needs_tool: false
+  category: knowledge
+
+- id: intent_no_tool_03
+  query: "帮我写一封感谢邮件"
+  needs_tool: false
+  category: writing
+
+- id: intent_no_tool_04
+  query: "解释一下 RESTful API 的设计原则"
+  needs_tool: false
+  category: knowledge
+
+- id: intent_no_tool_05
+  query: "总结一下上次会议的要点"
+  needs_tool: false
+  category: summary
+
+- id: intent_no_tool_06
+  query: "请推荐几本关于数据分析的书"
+  needs_tool: false
+  category: recommendation

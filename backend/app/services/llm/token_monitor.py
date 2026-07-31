@@ -72,7 +72,7 @@ class TokenMonitorService:
         """
         # 检查用户级配额
         user_quota = await self._get_quota("user", user_id)
-        if user_quota and user_quota.is_active:
+        if user_quota and user_quota.is_active and user_quota.monthly_token_limit > 0:
             if user_quota.current_month_tokens >= user_quota.monthly_token_limit:
                 raise QuotaExceededException(target_type="user", target_id=user_id)
             await self._check_alert_threshold(user_quota)
@@ -205,6 +205,8 @@ class TokenMonitorService:
         """检查预警阈值。"""
         if not quota or not quota.is_active:
             return
+        if quota.monthly_token_limit <= 0:
+            return  # 防止除零
         ratio = quota.current_month_tokens / quota.monthly_token_limit
         if ratio >= quota.alert_threshold:
             # 记录预警（避免重复，使用 Redis）
