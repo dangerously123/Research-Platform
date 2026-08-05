@@ -1,64 +1,74 @@
 <template>
   <div class="chat-container">
-    <!-- 会话列表侧边 -->
     <div class="sidebar">
-      <el-button type="primary" @click="createConversation" :loading="creatingConv"
-        :disabled="streaming" style="width:100%;margin-bottom:12px">
-        新建对话
+      <el-button
+        type="primary"
+        @click="createConversation"
+        :loading="creatingConv"
+        :disabled="streaming"
+        style="width:100%;margin-bottom:12px"
+      >
+        New Chat
       </el-button>
-      <div v-for="conv in conversations" :key="conv.id"
-        class="conv-item" :class="{ active: currentConvId === conv.id, disabled: streaming }"
-        @click="selectConversation(conv.id)">
-        {{ conv.title || `对话 #${conv.id}` }}
+      <div
+        v-for="conv in conversations"
+        :key="conv.id"
+        class="conv-item"
+        :class="{ active: currentConvId === conv.id, disabled: streaming }"
+        @click="selectConversation(conv.id)"
+      >
+        {{ conv.title || `Conversation #${conv.id}` }}
       </div>
     </div>
 
-    <!-- 聊天区域 -->
     <div class="chat-area">
-      <!-- 消息列表 -->
       <div class="messages" ref="messagesRef">
-        <!-- 空状态 -->
         <div v-if="!messages.length && !streaming" class="empty-state">
-          <p>开始新对话，输入您的问题</p>
+          <p>Start a new conversation and enter your question.</p>
         </div>
 
         <div v-for="msg in messages" :key="msg.message_id" class="message" :class="msg.role">
           <div class="bubble">
             <div class="content" v-html="renderMarkdown(msg.content)"></div>
             <div v-if="msg.sources?.length" class="sources">
-              <span class="source-label">参考来源：</span>
-              <el-tag v-for="s in msg.sources" :key="s.doc_id" size="small" type="info">
-                {{ s.title }}
+              <span class="source-label">Sources:</span>
+              <el-tag v-for="source in msg.sources" :key="source.doc_id" size="small" type="info">
+                {{ source.title }}
               </el-tag>
             </div>
           </div>
         </div>
 
-        <!-- 流式响应 -->
         <div v-if="streaming" class="message assistant">
           <div class="bubble">
             <div class="content">{{ streamContent }}<span class="cursor">|</span></div>
           </div>
         </div>
 
-        <!-- 错误提示 -->
         <div v-if="errorMsg" class="error-banner">
-          <el-alert :title="errorMsg" type="error" show-icon closable
-            @close="errorMsg = ''" />
+          <el-alert :title="errorMsg" type="error" show-icon closable @close="errorMsg = ''" />
         </div>
       </div>
 
-      <!-- 输入框 -->
       <div class="input-area">
-        <el-input v-model="inputText" placeholder="输入问题... (Ctrl+Enter 发送)"
-          :rows="2" type="textarea"
-          @keydown.enter.ctrl="sendMessage" :disabled="streaming" />
-        <el-button type="primary" @click="sendMessage" :loading="streaming"
-          :disabled="!inputText.trim() || streaming">
-          发送
+        <el-input
+          v-model="inputText"
+          placeholder="Ask a question... (Ctrl+Enter to send)"
+          :rows="2"
+          type="textarea"
+          @keydown.enter.ctrl="sendMessage"
+          :disabled="streaming"
+        />
+        <el-button
+          type="primary"
+          @click="sendMessage"
+          :loading="streaming"
+          :disabled="!inputText.trim() || streaming"
+        >
+          Send
         </el-button>
         <el-button v-if="streaming" type="danger" size="small" @click="abortStream">
-          停止
+          Stop
         </el-button>
       </div>
     </div>
@@ -79,27 +89,24 @@ const messagesRef = ref<HTMLElement>()
 const errorMsg = ref('')
 const creatingConv = ref(false)
 
-// SSE 控制
 let abortController: AbortController | null = null
 let streamTimeout: ReturnType<typeof setTimeout> | null = null
-const STREAM_TIMEOUT_MS = 90_000 // 90秒无数据超时
-
-// 会话切换锁：记录当前流式绑定的会话ID
 let streamingConvId: number | null = null
+const STREAM_TIMEOUT_MS = 90_000
 
-onMounted(() => { loadConversations() })
+onMounted(() => {
+  loadConversations()
+})
 
 onBeforeUnmount(() => {
-  // 页面卸载时取消进行中的流式请求
   abortStream()
 })
 
 async function loadConversations() {
   try {
-    // 实际项目中应分页加载
     conversations.value = []
   } catch {
-    // 静默
+    conversations.value = []
   }
 }
 
@@ -113,15 +120,14 @@ async function createConversation() {
     currentConvId.value = conv.id
     messages.value = []
     errorMsg.value = ''
-  } catch (e: any) {
-    errorMsg.value = '创建对话失败'
+  } catch {
+    errorMsg.value = 'Failed to create conversation.'
   } finally {
     creatingConv.value = false
   }
 }
 
 async function selectConversation(id: number) {
-  // 流式回答中禁止切换会话
   if (streaming.value) return
   if (currentConvId.value === id) return
 
@@ -129,17 +135,16 @@ async function selectConversation(id: number) {
   errorMsg.value = ''
   try {
     const res = await api.get(`/llm/conversations/${id}/messages`)
-    messages.value = res.data.messages
+    messages.value = res.data.messages || []
   } catch {
     messages.value = []
-    errorMsg.value = '加载会话历史失败'
+    errorMsg.value = 'Failed to load conversation history.'
   }
 }
 
 async function sendMessage() {
   if (!inputText.value.trim() || streaming.value) return
 
-  // 确保有会话
   if (!currentConvId.value) {
     await createConversation()
     if (!currentConvId.value) return
@@ -150,55 +155,43 @@ async function sendMessage() {
   errorMsg.value = ''
   messages.value.push({ message_id: Date.now(), role: 'user', content, sources: [] })
 
-  // 开始 SSE 流式接收
   streaming.value = true
   streamContent.value = ''
   streamingConvId = currentConvId.value
-
-  // 创建 AbortController
   abortController = new AbortController()
-  let sseBuffer = '' // 分片 buffer
+  let sseBuffer = ''
 
-  // 超时检测
   const resetTimeout = () => {
     if (streamTimeout) clearTimeout(streamTimeout)
     streamTimeout = setTimeout(() => {
+      errorMsg.value = 'Response timed out. Please retry.'
       abortStream()
-      errorMsg.value = '响应超时，请重试'
     }, STREAM_TIMEOUT_MS)
   }
+
   resetTimeout()
 
   try {
     const token = localStorage.getItem('token') || ''
-    const response = await fetch(
-      `/api/v1/llm/conversations/${streamingConvId}/messages`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
-        },
-        body: JSON.stringify({ content, use_rag: true, stream: true }),
-        signal: abortController.signal,
+    const response = await fetch(`/api/v1/llm/conversations/${streamingConvId}/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
       },
-    )
+      body: JSON.stringify({ content, use_rag: true, stream: true }),
+      signal: abortController.signal,
+    })
 
-    // HTTP 状态检查
     if (!response.ok) {
-      const status = response.status
-      if (status === 401) {
-        errorMsg.value = '登录已过期，请重新登录'
-      } else if (status === 429) {
-        errorMsg.value = '请求频率过高，请稍后再试'
-      } else {
-        errorMsg.value = `服务错误 (${status})，请重试`
-      }
+      if (response.status === 401) errorMsg.value = 'Login expired. Please sign in again.'
+      else if (response.status === 429) errorMsg.value = 'Too many requests. Please retry later.'
+      else errorMsg.value = `Service error (${response.status}). Please retry.`
       return
     }
 
     if (!response.body) {
-      errorMsg.value = '服务器返回空响应'
+      errorMsg.value = 'Server returned an empty response.'
       return
     }
 
@@ -209,13 +202,9 @@ async function sendMessage() {
       const { done, value } = await reader.read()
       if (done) break
 
-      // 每收到数据重置超时
       resetTimeout()
-
-      // 分片安全解析：追加到 buffer 后按完整行处理
       sseBuffer += decoder.decode(value, { stream: true })
       const lines = sseBuffer.split('\n')
-      // 最后一行可能不完整，保留在 buffer
       sseBuffer = lines.pop() || ''
 
       for (const line of lines) {
@@ -225,27 +214,22 @@ async function sendMessage() {
 
         try {
           const data = JSON.parse(jsonStr)
+          if (currentConvId.value !== streamingConvId) return
 
-          // 检查会话是否仍匹配（防止切换后写入错误会话）
-          if (currentConvId.value !== streamingConvId) break
+          if (data.token) streamContent.value += data.token
+          if (data.content && data.type === 'final_answer') streamContent.value = data.content
+          if (data.error) errorMsg.value = data.error
 
-          if (data.token) {
-            streamContent.value += data.token
-          }
           if (data.done) {
             messages.value.push({
               message_id: data.message_id || Date.now(),
               role: 'assistant',
               content: streamContent.value,
-              sources: [],
+              sources: data.sources || [],
             })
             streamContent.value = ''
           }
-          if (data.error) {
-            errorMsg.value = data.error
-          }
         } catch {
-          // JSON 解析失败：跳过（可能是空行或格式异常）
           continue
         }
       }
@@ -255,18 +239,17 @@ async function sendMessage() {
     }
   } catch (e: any) {
     if (e.name === 'AbortError') {
-      // 用户主动取消，不显示错误
       if (streamContent.value) {
         messages.value.push({
           message_id: Date.now(),
           role: 'assistant',
-          content: streamContent.value + '\n\n[已停止]',
+          content: `${streamContent.value}\n\n[Stopped]`,
           sources: [],
         })
         streamContent.value = ''
       }
     } else {
-      errorMsg.value = '网络连接失败，请检查网络后重试'
+      errorMsg.value = 'Network error. Please check your connection and retry.'
     }
   } finally {
     streaming.value = false
@@ -280,20 +263,17 @@ async function sendMessage() {
 }
 
 function abortStream() {
-  if (abortController) {
-    abortController.abort()
-  }
+  if (abortController) abortController.abort()
 }
 
 function renderMarkdown(text: string): string {
   if (!text) return ''
-  // 安全处理：转义 HTML 特殊字符后再替换换行
-  const escaped = text
+  return text
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
-  return escaped.replace(/\n/g, '<br>')
+    .replace(/\n/g, '<br>')
 }
 </script>
 

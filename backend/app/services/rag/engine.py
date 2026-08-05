@@ -318,7 +318,7 @@ class RAGEngine:
 
         # 0. 检查缓存
         if use_cache:
-            cached = await self._get_cached_results(query, user_id)
+            cached = await self._get_cached_results(query, user_id, top_k)
             if cached is not None:
                 return cached
 
@@ -385,7 +385,7 @@ class RAGEngine:
 
         # 缓存结果
         if use_cache and result:
-            await self._cache_results(query, user_id, result)
+            await self._cache_results(query, user_id, top_k, result)
 
         elapsed = (time.perf_counter() - start) * 1000
         return result
@@ -581,10 +581,10 @@ class RAGEngine:
     # ==================== 缓存 ====================
 
     async def _get_cached_results(
-        self, query: str, user_id: int
+        self, query: str, user_id: int, top_k: int
     ) -> list[DocumentFragment] | None:
-        """从缓存获取检索结果。"""
-        cache_key = self._build_cache_key(query, user_id)
+        """Get retrieval results from cache."""
+        cache_key = await self._build_cache_key(query, user_id, top_k)
         cached = await self.redis.get(cache_key)
         if not cached:
             return None
@@ -596,10 +596,10 @@ class RAGEngine:
             return None
 
     async def _cache_results(
-        self, query: str, user_id: int, results: list[DocumentFragment]
+        self, query: str, user_id: int, top_k: int, results: list[DocumentFragment]
     ) -> None:
-        """缓存检索结果。"""
-        cache_key = self._build_cache_key(query, user_id)
+        """Cache retrieval results."""
+        cache_key = await self._build_cache_key(query, user_id, top_k)
         data = [
             {
                 "id": d.id,
@@ -616,7 +616,17 @@ class RAGEngine:
         ]
         await self.redis.setex(cache_key, self.CACHE_TTL_SECONDS, json.dumps(data))
 
-    def _build_cache_key(self, query: str, user_id: int) -> str:
-        """构建缓存键。"""
+    async def _build_cache_key(self, query: str, user_id: int, top_k: int) -> str:
+        """Build a cache key including knowledge and permission versions."""
         query_hash = hashlib.md5(query.encode()).hexdigest()[:12]
-        return f"rag:cache:{user_id}:{query_hash}"
+        knowledge_version = await self._get_cache_version("rag:knowledge:version")
+        permission_version = await self._get_cache_version(f"rag:permission:version:{user_id}")
+        return f"rag:cache:v2:{knowledge_version}:{permission_version}:{user_id}:{top_k}:{query_hash}"
+
+    async def _get_cache_version(self, key: str) -> str:
+        value = await self.redis.get(key)
+        if value is None:
+            return "0"
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="ignore") or "0"
+        return str(value)

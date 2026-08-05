@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from app.services.auth.dependencies import get_current_user
 from app.services.llm.tools.registry import tool_registry
 from app.services.llm.tools.executor import ToolExecutor
+from app.services.permission.middleware import require_admin
 
 router = APIRouter()
 
@@ -58,6 +59,7 @@ async def list_categories(
 async def execute_tool(
     request: ExecuteToolRequest,
     current_user: dict = Depends(get_current_user),
+    _admin=Depends(require_admin),
 ):
     """
     手动执行指定工具（用于调试和直接调用）。

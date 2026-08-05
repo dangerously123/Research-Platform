@@ -207,6 +207,8 @@ class TokenMonitorService:
             return
         if quota.monthly_token_limit <= 0:
             return  # 防止除零
+        if quota.monthly_token_limit <= 0:
+            return
         ratio = quota.current_month_tokens / quota.monthly_token_limit
         if ratio >= quota.alert_threshold:
             # 记录预警（避免重复，使用 Redis）

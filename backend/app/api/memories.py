@@ -1,12 +1,11 @@
-"""用户记忆管理 API 路由：查看、搜索、删除个人记忆。"""
+"""User memory management API routes."""
 
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, Query
+import redis.asyncio as aioredis
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-
-import redis.asyncio as aioredis
 
 from app.core.database import get_db
 from app.core.redis import get_redis
@@ -36,7 +35,7 @@ class MemoryListResponse(BaseModel):
 
 
 class MemorySearchRequest(BaseModel):
-    query: str
+    query: str = Field(..., min_length=1, max_length=1000)
     top_k: int = Field(default=5, ge=1, le=20)
 
 
@@ -54,7 +53,7 @@ async def list_memories(
     db: AsyncSession = Depends(get_db),
     redis: aioredis.Redis = Depends(get_redis),
 ):
-    """获取当前用户的记忆列表（分页）。"""
+    """List current user's memories."""
     service = MemoryService(db=db, redis=redis)
     records, total = await service.get_user_memories(
         user_id=current_user["user_id"],
@@ -62,21 +61,20 @@ async def list_memories(
         page_size=page_size,
         topic=topic,
     )
-
     return MemoryListResponse(
         memories=[
             MemoryResponse(
-                id=r.id,
-                question=r.question,
-                answer_summary=r.answer_summary,
-                key_facts=r.key_facts,
-                topic_tags=r.topic_tags,
-                importance=r.importance,
-                access_count=r.access_count,
-                created_at=r.created_at,
-                last_accessed_at=r.last_accessed_at,
+                id=record.id,
+                question=record.question,
+                answer_summary=record.answer_summary,
+                key_facts=record.key_facts,
+                topic_tags=record.topic_tags,
+                importance=record.importance,
+                access_count=record.access_count,
+                created_at=record.created_at,
+                last_accessed_at=record.last_accessed_at,
             )
-            for r in records
+            for record in records
         ],
         total=total,
         page=page,
@@ -91,27 +89,26 @@ async def search_memories(
     db: AsyncSession = Depends(get_db),
     redis: aioredis.Redis = Depends(get_redis),
 ):
-    """语义搜索个人记忆。"""
+    """Semantic-search current user's memories."""
     service = MemoryService(db=db, redis=redis)
     results = await service.recall(
         user_id=current_user["user_id"],
         query=request.query,
         top_k=request.top_k,
-        min_score=0.5,  # 搜索时放宽阈值
+        min_score=0.5,
     )
-
     return MemorySearchResponse(
         query=request.query,
         results=[
             {
-                "memory_id": m["memory_id"],
-                "question": m["question"],
-                "answer_summary": m["answer_summary"],
-                "score": round(m["score"], 3),
-                "topic_tags": m["topic_tags"],
-                "created_at": m["created_at"].isoformat() if m.get("created_at") else None,
+                "memory_id": item["memory_id"],
+                "question": item["question"],
+                "answer_summary": item["answer_summary"],
+                "score": round(item["score"], 3),
+                "topic_tags": item["topic_tags"],
+                "created_at": item["created_at"].isoformat() if item.get("created_at") else None,
             }
-            for m in results
+            for item in results
         ],
     )
 
@@ -123,15 +120,11 @@ async def delete_memory(
     db: AsyncSession = Depends(get_db),
     redis: aioredis.Redis = Depends(get_redis),
 ):
-    """删除指定记忆。"""
+    """Delete one memory owned by current user."""
     service = MemoryService(db=db, redis=redis)
-    deleted = await service.delete_memory(
-        user_id=current_user["user_id"],
-        memory_id=memory_id,
-    )
+    deleted = await service.delete_memory(user_id=current_user["user_id"], memory_id=memory_id)
     if not deleted:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=404, detail="记忆不存在")
+        raise HTTPException(status_code=404, detail="Memory not found")
 
 
 @router.delete("", status_code=200)
@@ -140,7 +133,7 @@ async def clear_all_memories(
     db: AsyncSession = Depends(get_db),
     redis: aioredis.Redis = Depends(get_redis),
 ):
-    """清空当前用户的所有记忆。"""
+    """Delete all memories owned by current user."""
     service = MemoryService(db=db, redis=redis)
     count = await service.clear_all_memories(current_user["user_id"])
-    return {"message": f"已清空 {count} 条记忆"}
+    return {"message": f"Deleted {count} memories", "deleted": count}

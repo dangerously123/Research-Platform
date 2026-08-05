@@ -106,6 +106,7 @@ async def upload_document(
     request: DocumentUploadRequest,
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
     _admin=Depends(require_admin),
 ):
     """
@@ -126,6 +127,7 @@ async def upload_document(
         access_roles=request.access_roles,
         doc_type=request.doc_type,
     )
+    await redis.incr("rag:knowledge:version")
 
     return {
         "doc_id": doc_id,
@@ -139,11 +141,14 @@ async def upload_document(
 async def delete_document(
     doc_id: str,
     current_user: dict = Depends(get_current_user),
+    redis: aioredis.Redis = Depends(get_redis),
     _admin=Depends(require_admin),
 ):
     """删除知识库文档（管理员）。"""
     store = get_knowledge_store()
     deleted_count = await store.delete_document(doc_id)
+    if deleted_count:
+        await redis.incr("rag:knowledge:version")
     return {
         "doc_id": doc_id,
         "chunks_deleted": deleted_count,

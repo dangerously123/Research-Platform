@@ -1,18 +1,8 @@
-"""
-API 路由聚合模块。
-
-将所有子路由注册到一个顶层 router 中，
-main.py 只需导入此模块即可完成全部路由挂载。
-"""
+"""Aggregate API router."""
 
 from fastapi import APIRouter
 
 from app.core.config import settings
-
-# 顶层路由器
-api_router = APIRouter(prefix=settings.API_V1_PREFIX)
-
-# ---------- 导入各模块路由 ----------
 from app.api.auth import router as auth_router
 from app.api.roles import router as roles_router
 from app.api.permissions import router as permissions_router
@@ -30,20 +20,21 @@ from app.api.observability import router as observability_router
 from app.api.eval import router as eval_router
 from app.api.admin import router as admin_router
 
-# ---------- 注册子路由 ----------
-api_router.include_router(auth_router, prefix="/auth", tags=["认证"])
-api_router.include_router(roles_router, prefix="/roles", tags=["角色管理"])
-api_router.include_router(permissions_router, prefix="/users", tags=["权限管理"])
-api_router.include_router(knowledge_router, prefix="/knowledge", tags=["知识检索"])
-api_router.include_router(reports_router, prefix="/reports", tags=["数据报表"])
-api_router.include_router(llm_conversations_router, prefix="/llm/conversations", tags=["LLM对话"])
-api_router.include_router(llm_models_router, prefix="/llm/models", tags=["LLM模型管理"])
-api_router.include_router(prompts_router, prefix="/prompts/templates", tags=["Prompt模板"])
-api_router.include_router(tokens_router, prefix="/tokens", tags=["Token监控"])
-api_router.include_router(audit_router, prefix="/audit", tags=["审计日志"])
-api_router.include_router(memories_router, prefix="/memories", tags=["记忆管理"])
-api_router.include_router(tools_router, prefix="/tools", tags=["工具"])
-api_router.include_router(files_router, prefix="/files", tags=["文件管理"])
-api_router.include_router(observability_router, prefix="/observability", tags=["可观测性"])
-api_router.include_router(eval_router, prefix="/eval", tags=["评测系统"])
-api_router.include_router(admin_router, prefix="/admin", tags=["管理后台"])
+api_router = APIRouter(prefix=settings.API_V1_PREFIX)
+
+api_router.include_router(auth_router, prefix="/auth", tags=["auth"])
+api_router.include_router(roles_router, prefix="/roles", tags=["roles"])
+api_router.include_router(permissions_router, prefix="/users", tags=["permissions"])
+api_router.include_router(knowledge_router, prefix="/knowledge", tags=["knowledge"])
+api_router.include_router(reports_router, prefix="/reports", tags=["reports"])
+api_router.include_router(llm_conversations_router, prefix="/llm/conversations", tags=["llm-conversations"])
+api_router.include_router(llm_models_router, prefix="/llm/models", tags=["llm-models"])
+api_router.include_router(prompts_router, prefix="/prompts/templates", tags=["prompt-templates"])
+api_router.include_router(tokens_router, prefix="/tokens", tags=["tokens"])
+api_router.include_router(audit_router, prefix="/audit", tags=["audit"])
+api_router.include_router(memories_router, prefix="/memories", tags=["memories"])
+api_router.include_router(tools_router, prefix="/tools", tags=["tools"])
+api_router.include_router(files_router, prefix="/files", tags=["files"])
+api_router.include_router(observability_router, prefix="/observability", tags=["observability"])
+api_router.include_router(eval_router, prefix="/eval", tags=["eval"])
+api_router.include_router(admin_router, prefix="/admin", tags=["admin"])

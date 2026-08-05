@@ -1,31 +1,24 @@
-"""LLM 对话 API 路由。"""
+"""LLM conversation API routes."""
 
 import json
 
+import redis.asyncio as aioredis
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import redis.asyncio as aioredis
-
 from app.core.database import get_db
-from app.core.errors import LLM_001, LLM_005, LLM_009, AppException, NotFoundException
+from app.core.errors import LLM_001, LLM_005, AppException, NotFoundException
 from app.core.redis import get_redis
-from app.models.llm import LLMModelConfig
 from app.models.file import UploadedFile
-from app.schemas.llm import (
-    ConversationHistoryResponse,
-    ConversationResponse,
-    CreateConversationRequest,
-    LLMMessageResponse,
-    SendMessageRequest,
-)
+from app.models.llm import LLMModelConfig
+from app.schemas.llm import ConversationHistoryResponse, ConversationResponse, CreateConversationRequest, LLMMessageResponse, SendMessageRequest
 from app.services.auth.dependencies import get_current_user
 from app.services.llm.adapters.base import AllModelsUnavailableException, LLMRequest
-from app.services.llm.budget_allocator import InputTooLongException
 from app.services.llm.conversation import ConversationManager
 from app.services.llm.gateway import LLMGateway
+from app.services.llm.memory import MemoryService
 from app.services.llm.prompt_engine import PromptTemplateEngine
 from app.services.llm.security import LLMSecurityFilter
 from app.services.llm.token_monitor import TokenMonitorService
@@ -34,57 +27,111 @@ router = APIRouter()
 
 
 async def _get_primary_model_config(db: AsyncSession) -> LLMModelConfig | None:
-    """获取当前优先级最高的活跃模型配置。"""
-    stmt = (
-        select(LLMModelConfig)
-        .where(LLMModelConfig.status == "active")
-        .order_by(LLMModelConfig.priority)
-        .limit(1)
+    result = await db.execute(
+        select(LLMModelConfig).where(LLMModelConfig.status == "active").order_by(LLMModelConfig.priority).limit(1)
     )
-    result = await db.execute(stmt)
     return result.scalar_one_or_none()
 
 
 async def _load_file_context(db: AsyncSession, user_id: int, file_ids: list[int]) -> str:
-    """
-    加载文件提取内容，组装为 Agent 可用的上下文文本。
-
-    Args:
-        db: 数据库会话
-        user_id: 用户ID（验证归属）
-        file_ids: 文件ID列表
-
-    Returns:
-        组装后的文件上下文文本
-    """
     if not file_ids:
         return ""
-
-    stmt = select(UploadedFile).where(
-        UploadedFile.id.in_(file_ids),
-        UploadedFile.user_id == user_id,
-        UploadedFile.process_status == "completed",
+    result = await db.execute(
+        select(UploadedFile).where(
+            UploadedFile.id.in_(file_ids),
+            UploadedFile.user_id == user_id,
+            UploadedFile.process_status == "completed",
+        )
     )
-    result = await db.execute(stmt)
-    files = result.scalars().all()
+    parts: list[str] = []
+    for uploaded_file in result.scalars().all():
+        file_parts = [f"--- File: {uploaded_file.original_name} ({uploaded_file.file_type}) ---"]
+        if uploaded_file.image_description:
+            file_parts.append(f"Image description: {uploaded_file.image_description}")
+        if uploaded_file.ocr_text:
+            file_parts.append(f"OCR text: {uploaded_file.ocr_text}")
+        if uploaded_file.extracted_content:
+            file_parts.append(f"Content: {uploaded_file.extracted_content}")
+        parts.append("\n".join(file_parts))
+    return "\n\n".join(parts)
 
-    if not files:
-        return ""
 
-    context_parts = []
-    for f in files:
-        parts = [f"--- 文件: {f.original_name} ({f.file_type}) ---"]
+def _message_response(message, content: str | None = None) -> LLMMessageResponse:
+    return LLMMessageResponse(
+        message_id=message.id,
+        role=message.role,
+        content=message.content if content is None else content,
+        sources=message.sources or [],
+        relevance_score=message.relevance_score,
+        input_tokens=message.input_tokens,
+        output_tokens=message.output_tokens,
+    )
 
-        if f.image_description:
-            parts.append(f"[图片描述]: {f.image_description}")
-        if f.ocr_text:
-            parts.append(f"[图片文字]: {f.ocr_text}")
-        if f.extracted_content:
-            parts.append(f"[文件内容]: {f.extracted_content}")
 
-        context_parts.append("\n".join(parts))
+async def _build_prompt(
+    db: AsyncSession,
+    redis: aioredis.Redis,
+    manager: ConversationManager,
+    conversation_id: int,
+    user_id: int,
+    content: str,
+    file_ids: list[int],
+) -> tuple[str, int]:
+    model_config = await _get_primary_model_config(db)
+    context_window = model_config.context_window if model_config else 8192
+    max_tokens = model_config.max_tokens if model_config else 4096
+    provider = model_config.provider if model_config else "openai"
 
-    return "\n\n".join(context_parts)
+    context_messages, memory_context = await manager.build_prompt_context_with_memory(
+        conversation_id=conversation_id,
+        user_id=user_id,
+        current_query=content,
+        model_max_tokens=context_window,
+    )
+    conversation_history = "\n".join(f"{item['role']}: {item['content']}" for item in context_messages[-20:])
+    file_context = await _load_file_context(db, user_id, file_ids)
+
+    prompt_engine = PromptTemplateEngine(db=db)
+    template_id = await prompt_engine.match_template(content)
+    system_prompt = await prompt_engine.get_system_prompt(template_id)
+    allocation = await manager.build_prompt_with_budget(
+        conversation_id=conversation_id,
+        user_id=user_id,
+        current_query=content,
+        system_prompt=system_prompt,
+        model_context_window=context_window,
+        max_output_tokens=max_tokens,
+        provider=provider,
+        rag_docs="",
+        file_context=file_context,
+        tools_prompt="",
+    )
+    if memory_context or conversation_history:
+        prompt = f"{allocation.prompt}\n\nMemory context:\n{memory_context}\n\nRecent conversation:\n{conversation_history}"
+    else:
+        prompt = allocation.prompt
+    return prompt, allocation.available_output_tokens
+
+
+async def _save_memory_safe(
+    db: AsyncSession,
+    redis: aioredis.Redis,
+    user_id: int,
+    question: str,
+    answer: str,
+    conversation_id: int,
+    message_id: int,
+) -> None:
+    try:
+        await MemoryService(db=db, redis=redis).save_memory(
+            user_id=user_id,
+            question=question,
+            answer=answer,
+            conversation_id=conversation_id,
+            message_id=message_id,
+        )
+    except Exception:
+        return
 
 
 @router.post("", response_model=ConversationResponse, status_code=201)
@@ -94,20 +141,16 @@ async def create_conversation(
     db: AsyncSession = Depends(get_db),
     redis: aioredis.Redis = Depends(get_redis),
 ):
-    """创建新对话。"""
     manager = ConversationManager(db=db, redis=redis)
-    conv = await manager.create_conversation(
-        user_id=current_user["user_id"],
-        title=request.title,
-    )
+    conversation = await manager.create_conversation(user_id=current_user["user_id"], title=request.title)
     return ConversationResponse(
-        id=conv.id,
-        title=conv.title,
-        status=conv.status,
-        model_id=conv.model_id,
-        total_input_tokens=conv.total_input_tokens,
-        total_output_tokens=conv.total_output_tokens,
-        created_at=conv.created_at,
+        id=conversation.id,
+        title=conversation.title,
+        status=conversation.status,
+        model_id=conversation.model_id,
+        total_input_tokens=conversation.total_input_tokens,
+        total_output_tokens=conversation.total_output_tokens,
+        created_at=conversation.created_at,
     )
 
 
@@ -119,352 +162,93 @@ async def send_message(
     db: AsyncSession = Depends(get_db),
     redis: aioredis.Redis = Depends(get_redis),
 ):
-    """发送消息并获取 LLM 回答。支持 SSE 流式响应。"""
     user_id = current_user["user_id"]
-    department_id = current_user.get("department_id", 0)
-
-    # 验证会话
+    department_id = current_user.get("department_id") or 0
     manager = ConversationManager(db=db, redis=redis)
-    conv = await manager.get_conversation(conversation_id, user_id)
-    if not conv:
+    conversation = await manager.get_conversation(conversation_id, user_id)
+    if not conversation:
         raise NotFoundException(LLM_005)
 
-    # 安全检查
     security = LLMSecurityFilter(db=db, redis=redis)
     await security.check_prompt_injection(request.content, user_id)
     await security.check_rate_limit(user_id)
-
-    # 配额检查
     token_monitor = TokenMonitorService(db=db, redis=redis)
     await token_monitor.check_quota(user_id, department_id)
 
-    # 保存用户消息
     await manager.add_message(conversation_id, role="user", content=request.content)
-
-    # ===== 获取模型配置（用于预算分配）=====
-    model_config = await _get_primary_model_config(db)
-    model_context_window = model_config.context_window if model_config else 8192
-    model_max_tokens = model_config.max_tokens if model_config else 4096
-    model_provider = model_config.provider if model_config else "openai"
-
-    # 构建上下文（含长期记忆检索）— 保留旧接口用于意图识别
-    context_messages, memory_context = await manager.build_prompt_context_with_memory(
-        conversation_id=conversation_id,
-        user_id=user_id,
-        current_query=request.content,
-    )
-
-    # ===== 意图识别（增强版）=====
-    from app.services.llm.intent import IntentResolver
-    from app.services.llm.intent.classifier import IntentCategory, ConfidenceLevel
-    from app.services.llm.tools.executor import SmartToolRouter
-
-    intent_resolver = IntentResolver(db=db, redis=redis)
-    plan = await intent_resolver.resolve(request.content, context_messages)
-
-    # 根据执行计划决定工具策略
-    tool_router = SmartToolRouter()
-    pre_result = None
-    tools_prompt = ""
-
-    if plan.pre_execute_tools:
-        # 高置信度预执行
-        for tool_spec in plan.pre_execute_tools:
-            result = await tool_router.executor.execute_tool(
-                tool_spec["tool"], **tool_spec["params"]
-            )
-            if result and "error" not in result:
-                pre_result = {
-                    "tool": tool_spec["tool"],
-                    "result": result,
-                    "context_injection": str(result),
-                }
-                break
-        tools_prompt = tool_router.build_enhanced_prompt(request.content, pre_result)
-    elif plan.should_inject_tools:
-        # 中/低置信度：注入相关工具描述让 LLM 自主决定
-        from app.services.llm.tools.intent_matcher import intent_matcher
-        tools_prompt = intent_matcher.get_relevant_tools_prompt(
-            plan.intent_result.rewritten_query or request.content
-        )
-
-    # 构建 Prompt 附加指令
-    extra_instructions = "\n".join(plan.prompt_additions) if plan.prompt_additions else ""
-    if extra_instructions:
-        tools_prompt = tools_prompt + "\n" + extra_instructions if tools_prompt else extra_instructions
-
-    # ===== 使用预算分配器构建 Prompt =====
-    # 获取系统 Prompt 模板
-    prompt_engine = PromptTemplateEngine(db=db)
-    template_id = await prompt_engine.match_template(request.content)
-    system_prompt = await prompt_engine.get_system_prompt(template_id)
-
-    # 加载关联文件的提取内容
-    file_context = ""
-    if request.file_ids:
-        file_context = await _load_file_context(db, user_id, request.file_ids)
-
-    # 通过预算分配器统一裁剪
-    try:
-        budget_result = await manager.build_prompt_with_budget(
-            conversation_id=conversation_id,
-            user_id=user_id,
-            current_query=plan.intent_result.rewritten_query or request.content,
-            system_prompt=system_prompt,
-            model_context_window=model_context_window,
-            max_output_tokens=model_max_tokens,
-            provider=model_provider,
-            tools_prompt=tools_prompt,
-            rag_docs="" if not plan.should_use_rag else "",
-            file_context=file_context,
-        )
-        prompt = budget_result.assemble_prompt()
-    except InputTooLongException as e:
-        raise AppException(
-            LLM_009,
-            status_code=400,
-            detail=str(e),
-        )
-
-    # ===== 判断是否使用 ReAct 循环 =====
-    from app.services.llm.intent.resolver import ExecutionPath
-    use_react = plan.path in (
-        ExecutionPath.TOOL_LLM_CALL,
-        ExecutionPath.MULTI_STEP,
-        ExecutionPath.LLM_FALLBACK,
-    ) and plan.should_inject_tools and not pre_result
-
-    if use_react and not request.stream:
-        # 使用 ReAct Agent 循环推理（非流式）
-        from app.services.llm.react import ReActAgent, ReActConfig
-        react_config = ReActConfig(
-            max_iterations=5,
-            quality_threshold=0.8,
-            enable_self_check=True,
-            timeout_seconds=60,
-        )
-        react_agent = ReActAgent(db=db, redis=redis, config=react_config)
-        react_result = await react_agent.run(
-            query=plan.intent_result.rewritten_query or request.content,
-            context=memory_context,
-            tools_prompt=tools_prompt,
-        )
-
-        # 输出过滤
-        filtered_content = security.filter_output(react_result.final_answer)
-
-        # 保存助手消息
-        msg = await manager.add_message(
-            conversation_id,
-            role="assistant",
-            content=filtered_content,
-            model_id=react_result.model_id,
-            input_tokens=react_result.total_input_tokens,
-            output_tokens=react_result.total_output_tokens,
-        )
-
-        # 记录 Token 用量
-        await token_monitor.record_usage(
-            user_id=user_id,
-            department_id=department_id,
-            model_id=react_result.model_id or "unknown",
-            input_tokens=react_result.total_input_tokens,
-            output_tokens=react_result.total_output_tokens,
-            conversation_id=conversation_id,
-        )
-
-        # 写入记忆
-        try:
-            from app.services.llm.memory import MemoryService
-            memory_service = MemoryService(db=db, redis=redis)
-            await memory_service.save_memory(
-                user_id=user_id,
-                question=request.content,
-                answer=filtered_content,
-                conversation_id=conversation_id,
-                message_id=msg.id,
-            )
-        except Exception:
-            pass
-
-        return LLMMessageResponse(
-            message_id=msg.id,
-            role="assistant",
-            content=filtered_content,
-            input_tokens=react_result.total_input_tokens,
-            output_tokens=react_result.total_output_tokens,
-        )
-
-    elif use_react and request.stream:
-        # 使用 ReAct Agent 流式输出推理过程
-        from app.services.llm.react import ReActAgent, ReActConfig
-
-        async def react_event_generator():
-            react_config = ReActConfig(max_iterations=5, quality_threshold=0.8, timeout_seconds=60)
-            react_agent = ReActAgent(db=db, redis=redis, config=react_config)
-
-            try:
-                async for event in react_agent.run_stream(
-                    query=plan.intent_result.rewritten_query or request.content,
-                    context=memory_context,
-                    tools_prompt=tools_prompt,
-                ):
-                    if event["type"] == "thought":
-                        yield f"data: {json.dumps({'type': 'thought', 'content': event['content'], 'iteration': event['iteration']})}\n\n"
-                    elif event["type"] == "action":
-                        yield f"data: {json.dumps({'type': 'action', 'tool': event['tool'], 'iteration': event['iteration']})}\n\n"
-                    elif event["type"] == "observation":
-                        yield f"data: {json.dumps({'type': 'observation', 'content': event['content'], 'iteration': event['iteration']})}\n\n"
-                    elif event["type"] == "final_answer":
-                        final_content = security.filter_output(event["content"])
-
-                        msg = await manager.add_message(
-                            conversation_id, role="assistant", content=final_content,
-                            output_tokens=len(final_content) // 2,
-                        )
-                        await token_monitor.record_usage(
-                            user_id=user_id, department_id=department_id,
-                            model_id="react", input_tokens=0,
-                            output_tokens=len(final_content) // 2,
-                            conversation_id=conversation_id,
-                        )
-                        try:
-                            from app.services.llm.memory import MemoryService
-                            memory_service = MemoryService(db=db, redis=redis)
-                            await memory_service.save_memory(
-                                user_id=user_id, question=request.content,
-                                answer=final_content, conversation_id=conversation_id,
-                                message_id=msg.id,
-                            )
-                        except Exception:
-                            pass
-
-                        await db.commit()
-                        yield f"data: {json.dumps({'type': 'final_answer', 'content': final_content, 'done': True, 'message_id': msg.id, 'iterations': event['iterations'], 'exit_reason': event['exit_reason']})}\n\n"
-            except Exception as e:
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
-
-        return StreamingResponse(
-            react_event_generator(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
-
-    # ===== 非 ReAct 路径：原有单次调用逻辑 =====
-
-    # 调用 LLM
+    prompt, max_tokens = await _build_prompt(db, redis, manager, conversation_id, user_id, request.content, request.file_ids)
+    sanitized_prompt = security.sanitize_outbound(prompt)
     gateway = LLMGateway(db=db, redis=redis)
-    llm_request = LLMRequest(prompt=prompt, stream=request.stream)
+    llm_request = LLMRequest(prompt=sanitized_prompt, max_tokens=max_tokens, stream=request.stream)
 
     if request.stream:
-        # 流式响应
         async def event_generator():
+            full_content = ""
+            model_id = ""
             try:
                 iterator, model_id = await gateway.stream_generate(llm_request)
-                full_content = ""
                 async for token in iterator:
                     full_content += token
-                    yield f"data: {json.dumps({'token': token})}\n\n"
-
-                # 保存助手消息
-                msg = await manager.add_message(
+                    yield f"data: {json.dumps({'token': token}, ensure_ascii=False)}\n\n"
+                filtered_content = security.filter_output(full_content)
+                output_tokens = max(1, len(filtered_content) // 4)
+                input_tokens = max(1, len(sanitized_prompt) // 4)
+                message = await manager.add_message(
                     conversation_id,
                     role="assistant",
-                    content=full_content,
+                    content=filtered_content,
                     model_id=model_id,
-                    output_tokens=len(full_content) // 2,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
                 )
-
-                # 记录 Token 用量
                 await token_monitor.record_usage(
                     user_id=user_id,
                     department_id=department_id,
-                    model_id=model_id,
-                    input_tokens=len(prompt) // 2,
-                    output_tokens=len(full_content) // 2,
+                    model_id=model_id or "unknown",
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
                     conversation_id=conversation_id,
+                    request_type="chat",
                 )
-
-                # 异步写入长期记忆
-                try:
-                    from app.services.llm.memory import MemoryService
-                    memory_service = MemoryService(db=db, redis=redis)
-                    await memory_service.save_memory(
-                        user_id=user_id,
-                        question=request.content,
-                        answer=full_content,
-                        conversation_id=conversation_id,
-                        message_id=msg.id,
-                    )
-                except Exception:
-                    pass
-
+                await _save_memory_safe(db, redis, user_id, request.content, filtered_content, conversation_id, message.id)
                 await db.commit()
-
-                yield f"data: {json.dumps({'done': True, 'message_id': msg.id})}\n\n"
+                yield f"data: {json.dumps({'done': True, 'message_id': message.id}, ensure_ascii=False)}\n\n"
             except AllModelsUnavailableException:
-                yield f"data: {json.dumps({'error': 'LLM 服务暂时不可用'})}\n\n"
+                yield f"data: {json.dumps({'error': 'LLM service unavailable'}, ensure_ascii=False)}\n\n"
+            except Exception as exc:
+                yield f"data: {json.dumps({'error': str(exc)}, ensure_ascii=False)}\n\n"
 
         return StreamingResponse(
             event_generator(),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-    else:
-        # 非流式
-        try:
-            response = await gateway.generate(llm_request)
-        except AllModelsUnavailableException:
-            raise AppException(LLM_001, status_code=503)
 
-        # 输出过滤
-        filtered_content = security.filter_output(response.content)
+    try:
+        response = await gateway.generate(llm_request)
+    except AllModelsUnavailableException:
+        raise AppException(LLM_001, status_code=503)
 
-        # 后执行阶段：处理 LLM 回答中的工具调用
-        if tool_router.executor.has_tool_calls(filtered_content):
-            filtered_content, _tool_log = await tool_router.post_execute(filtered_content)
-
-        # 保存助手消息
-        msg = await manager.add_message(
-            conversation_id,
-            role="assistant",
-            content=filtered_content,
-            model_id=response.model_id,
-            input_tokens=response.input_tokens,
-            output_tokens=response.output_tokens,
-        )
-
-        # 记录 Token 用量
-        await token_monitor.record_usage(
-            user_id=user_id,
-            department_id=department_id,
-            model_id=response.model_id,
-            input_tokens=response.input_tokens,
-            output_tokens=response.output_tokens,
-            conversation_id=conversation_id,
-        )
-
-        # 异步写入长期记忆
-        try:
-            from app.services.llm.memory import MemoryService
-            memory_service = MemoryService(db=db, redis=redis)
-            await memory_service.save_memory(
-                user_id=user_id,
-                question=request.content,
-                answer=filtered_content,
-                conversation_id=conversation_id,
-                message_id=msg.id,
-            )
-        except Exception:
-            pass  # 记忆写入失败不影响正常回答
-
-        return LLMMessageResponse(
-            message_id=msg.id,
-            role="assistant",
-            content=filtered_content,
-            input_tokens=response.input_tokens,
-            output_tokens=response.output_tokens,
-        )
+    filtered_content = security.filter_output(response.content)
+    message = await manager.add_message(
+        conversation_id,
+        role="assistant",
+        content=filtered_content,
+        model_id=response.model_id,
+        input_tokens=response.input_tokens,
+        output_tokens=response.output_tokens,
+    )
+    await token_monitor.record_usage(
+        user_id=user_id,
+        department_id=department_id,
+        model_id=response.model_id or "unknown",
+        input_tokens=response.input_tokens,
+        output_tokens=response.output_tokens,
+        conversation_id=conversation_id,
+        request_type="chat",
+    )
+    await _save_memory_safe(db, redis, user_id, request.content, filtered_content, conversation_id, message.id)
+    return _message_response(message, filtered_content)
 
 
 @router.post("/{conversation_id}/regenerate", response_model=LLMMessageResponse)
@@ -474,45 +258,26 @@ async def regenerate(
     db: AsyncSession = Depends(get_db),
     redis: aioredis.Redis = Depends(get_redis),
 ):
-    """重新生成最后一条回答。"""
     user_id = current_user["user_id"]
-
     manager = ConversationManager(db=db, redis=redis)
-    conv = await manager.get_conversation(conversation_id, user_id)
-    if not conv:
+    conversation = await manager.get_conversation(conversation_id, user_id)
+    if not conversation:
         raise NotFoundException(LLM_005)
-
-    # 获取最后一条用户消息
     history = await manager.get_conversation_history(conversation_id, page=1, page_size=100)
-    last_user_msg = None
-    for msg in reversed(history):
-        if msg.role == "user":
-            last_user_msg = msg
-            break
-
-    if not last_user_msg:
+    last_user_message = next((message for message in reversed(history) if message.role == "user"), None)
+    if not last_user_message:
         raise AppException(LLM_005, status_code=400)
 
-    # 重新调用 LLM
-    prompt_engine = PromptTemplateEngine(db=db)
-    template_id = await prompt_engine.match_template(last_user_msg.content)
-    prompt = await prompt_engine.render(template_id, {
-        "user_query": last_user_msg.content,
-        "context_docs": "",
-        "conversation_history": "",
-        "current_time": "",
-    })
-
+    security = LLMSecurityFilter(db=db, redis=redis)
+    prompt, max_tokens = await _build_prompt(db, redis, manager, conversation_id, user_id, last_user_message.content, [])
     gateway = LLMGateway(db=db, redis=redis)
     try:
-        response = await gateway.generate(LLMRequest(prompt=prompt, stream=False))
+        response = await gateway.generate(LLMRequest(prompt=security.sanitize_outbound(prompt), max_tokens=max_tokens, stream=False))
     except AllModelsUnavailableException:
         raise AppException(LLM_001, status_code=503)
 
-    security = LLMSecurityFilter(db=db, redis=redis)
     filtered = security.filter_output(response.content)
-
-    msg = await manager.add_message(
+    message = await manager.add_message(
         conversation_id,
         role="assistant",
         content=filtered,
@@ -520,26 +285,16 @@ async def regenerate(
         input_tokens=response.input_tokens,
         output_tokens=response.output_tokens,
     )
-
-    # 记录用量
-    token_monitor = TokenMonitorService(db=db, redis=redis)
-    await token_monitor.record_usage(
+    await TokenMonitorService(db=db, redis=redis).record_usage(
         user_id=user_id,
-        department_id=current_user.get("department_id", 0),
-        model_id=response.model_id,
+        department_id=current_user.get("department_id") or 0,
+        model_id=response.model_id or "unknown",
         input_tokens=response.input_tokens,
         output_tokens=response.output_tokens,
         conversation_id=conversation_id,
-        request_type="regenerate",
+        request_type="chat",
     )
-
-    return LLMMessageResponse(
-        message_id=msg.id,
-        role="assistant",
-        content=filtered,
-        input_tokens=response.input_tokens,
-        output_tokens=response.output_tokens,
-    )
+    return _message_response(message, filtered)
 
 
 @router.get("/{conversation_id}/messages", response_model=ConversationHistoryResponse)
@@ -549,28 +304,15 @@ async def get_history(
     db: AsyncSession = Depends(get_db),
     redis: aioredis.Redis = Depends(get_redis),
 ):
-    """获取会话历史。"""
     manager = ConversationManager(db=db, redis=redis)
-    conv = await manager.get_conversation(conversation_id, current_user["user_id"])
-    if not conv:
+    conversation = await manager.get_conversation(conversation_id, current_user["user_id"])
+    if not conversation:
         raise NotFoundException(LLM_005)
-
     messages = await manager.get_conversation_history(conversation_id)
     return ConversationHistoryResponse(
         conversation_id=conversation_id,
-        messages=[
-            LLMMessageResponse(
-                message_id=m.id,
-                role=m.role,
-                content=m.content,
-                sources=m.sources or [],
-                relevance_score=m.relevance_score,
-                input_tokens=m.input_tokens,
-                output_tokens=m.output_tokens,
-            )
-            for m in messages
-        ],
-        total_tokens=conv.total_input_tokens + conv.total_output_tokens,
+        messages=[_message_response(message) for message in messages],
+        total_tokens=conversation.total_input_tokens + conversation.total_output_tokens,
     )
 
 
@@ -581,9 +323,8 @@ async def delete_conversation(
     db: AsyncSession = Depends(get_db),
     redis: aioredis.Redis = Depends(get_redis),
 ):
-    """删除会话。"""
     manager = ConversationManager(db=db, redis=redis)
-    conv = await manager.get_conversation(conversation_id, current_user["user_id"])
-    if not conv:
+    conversation = await manager.get_conversation(conversation_id, current_user["user_id"])
+    if not conversation:
         raise NotFoundException(LLM_005)
     await manager.delete_conversation(conversation_id)

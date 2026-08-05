@@ -1,86 +1,129 @@
-"""文件上传与管理 API 路由。"""
+"""File upload and management API routes."""
 
 from datetime import datetime, timezone
+import logging
 
-from fastapi import APIRouter, Depends, File, Query, UploadFile
-from sqlalchemy import select, func
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
+from app.core.database import async_session_factory, get_db
+from app.core.security import file_security_scanner
 from app.models.file import UploadedFile
 from app.schemas.file import FileInfoResponse, FileListResponse, FileUploadResponse
 from app.services.auth.dependencies import get_current_user
 from app.services.file_processor import process_file
 from app.services.file_processor.storage import (
+    FILE_SIZE_LIMITS,
+    delete_file as delete_stored_file,
     detect_file_type,
     generate_storage_path,
     get_absolute_path,
-    save_file,
+    prepare_storage_path,
     validate_file,
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+CHUNK_SIZE = 1024 * 1024
+SCAN_HEADER_BYTES = 8192
+
+
+async def _process_uploaded_file(file_id: int) -> None:
+    """Background file parsing task that updates processing status."""
+    async with async_session_factory() as session:
+        try:
+            result = await session.execute(select(UploadedFile).where(UploadedFile.id == file_id))
+            uploaded = result.scalar_one_or_none()
+            if not uploaded:
+                logger.warning("[Files] Background processing skipped; file_id=%s not found", file_id)
+                return
+
+            uploaded.process_status = "processing"
+            await session.flush()
+
+            abs_path = get_absolute_path(uploaded.storage_path)
+            process_result = await process_file(abs_path, uploaded.file_type, uploaded.mime_type)
+
+            if process_result.success:
+                uploaded.process_status = "completed"
+                uploaded.extracted_content = process_result.text_content or None
+                uploaded.extracted_metadata = process_result.structured_data or None
+                uploaded.image_description = process_result.image_description or None
+                uploaded.ocr_text = process_result.ocr_text or None
+                uploaded.error_message = None
+            else:
+                uploaded.process_status = "failed"
+                uploaded.error_message = (process_result.error or "Processing failed")[:512]
+
+            uploaded.processed_at = datetime.now(timezone.utc)
+            await session.commit()
+        except Exception as exc:
+            logger.exception("[Files] Background processing failed: file_id=%s", file_id)
+            await session.rollback()
+            async with async_session_factory() as fail_session:
+                fail_result = await fail_session.execute(select(UploadedFile).where(UploadedFile.id == file_id))
+                failed = fail_result.scalar_one_or_none()
+                if failed:
+                    failed.process_status = "failed"
+                    failed.error_message = str(exc)[:512]
+                    failed.processed_at = datetime.now(timezone.utc)
+                    await fail_session.commit()
 
 
 @router.post("/upload", response_model=FileUploadResponse, status_code=201)
 async def upload_file(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     conversation_id: int | None = Query(default=None),
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    上传文件。支持图片、Excel、CSV、PDF、Word、文本文件。
-    流程：验证 → 安全扫描 → 存储 → 异步处理（小文件同步，大文件返回 processing）。
-    """
-    from app.core.security import file_security_scanner
-    from app.services.file_processor.storage import FILE_SIZE_LIMITS
-
+    """Upload a file, persist it safely, and process it in the background."""
     user_id = current_user["user_id"]
     filename = file.filename or "unknown"
     mime_type = file.content_type or "application/octet-stream"
-
-    # 1. 先验证文件名和扩展名（不读内容）
     file_type = detect_file_type(mime_type, filename)
-    max_size = FILE_SIZE_LIMITS.get(file_type, FILE_SIZE_LIMITS.get("other", 10 * 1024 * 1024))
+    max_size = FILE_SIZE_LIMITS.get(file_type, FILE_SIZE_LIMITS["other"])
 
-    # 2. 流式读取，限制最大大小（避免一次性撑爆内存）
-    chunks = []
+    storage_path = generate_storage_path(user_id, filename)
+    abs_path = prepare_storage_path(storage_path)
     total_size = 0
-    while True:
-        chunk = await file.read(1024 * 1024)  # 每次读 1MB
-        if not chunk:
-            break
-        total_size += len(chunk)
-        if total_size > max_size:
-            from fastapi import HTTPException
-            max_mb = max_size / (1024 * 1024)
-            raise HTTPException(
-                status_code=400,
-                detail=f"文件过大，{file_type} 类型限制为 {max_mb:.0f}MB",
-            )
-        chunks.append(chunk)
+    header = bytearray()
 
-    content = b"".join(chunks)
-    file_size = total_size
+    try:
+        with open(abs_path, "wb") as output:
+            while True:
+                chunk = await file.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > max_size:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"File too large; {file_type} limit is {max_size // (1024 * 1024)}MB",
+                    )
+                if len(header) < SCAN_HEADER_BYTES:
+                    needed = SCAN_HEADER_BYTES - len(header)
+                    header.extend(chunk[:needed])
+                output.write(chunk)
+    except Exception:
+        delete_stored_file(storage_path)
+        raise
+    finally:
+        await file.close()
 
-    # 3. 验证文件（扩展名、文件名安全）
-    is_valid, error = validate_file(filename, file_size, mime_type)
+    is_valid, error = validate_file(filename, total_size, mime_type)
     if not is_valid:
-        from fastapi import HTTPException
+        delete_stored_file(storage_path)
         raise HTTPException(status_code=400, detail=error)
 
-    # 4. 安全扫描（魔术字节、双扩展名、路径穿越）
-    scan_ok, scan_reason = file_security_scanner.scan(filename, content[:8192], mime_type)
+    scan_ok, scan_reason = file_security_scanner.scan(filename, bytes(header), mime_type)
     if not scan_ok:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=400, detail=f"文件安全检查未通过: {scan_reason}")
+        delete_stored_file(storage_path)
+        raise HTTPException(status_code=400, detail=f"File security check failed: {scan_reason}")
 
-    # 5. 存储文件
-    storage_path = generate_storage_path(user_id, filename)
-    await save_file(content, storage_path)
-
-    # 6. 写入数据库
     uploaded = UploadedFile(
         user_id=user_id,
         conversation_id=conversation_id,
@@ -88,33 +131,20 @@ async def upload_file(
         storage_path=storage_path,
         file_type=file_type,
         mime_type=mime_type,
-        file_size=file_size,
-        process_status="processing",
+        file_size=total_size,
+        process_status="pending",
     )
-    db.add(uploaded)
-    await db.flush()
 
-    # 7. 处理文件内容：小文件同步处理，大文件标记为 processing 后续异步
-    SYNC_THRESHOLD = 5 * 1024 * 1024  # 5MB 以内同步处理
-    if file_size <= SYNC_THRESHOLD:
-        abs_path = get_absolute_path(storage_path)
-        result = await process_file(abs_path, file_type, mime_type)
+    try:
+        db.add(uploaded)
+        await db.flush()
+        await db.refresh(uploaded)
+        await db.commit()
+    except Exception:
+        delete_stored_file(storage_path)
+        raise
 
-        if result.success:
-            uploaded.process_status = "completed"
-            uploaded.extracted_content = result.text_content or None
-            uploaded.extracted_metadata = result.structured_data or None
-            uploaded.image_description = result.image_description or None
-            uploaded.ocr_text = result.ocr_text or None
-        else:
-            uploaded.process_status = "failed"
-            uploaded.error_message = result.error
-
-        from datetime import datetime, timezone
-        uploaded.processed_at = datetime.now(timezone.utc)
-    # 大文件保持 processing 状态，由后台 Celery 处理
-
-    await db.flush()
+    background_tasks.add_task(_process_uploaded_file, uploaded.id)
 
     return FileUploadResponse(
         file_id=uploaded.id,
@@ -133,17 +163,16 @@ async def get_file_info(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """获取文件详细信息（含提取内容）。"""
-    stmt = select(UploadedFile).where(
-        UploadedFile.id == file_id,
-        UploadedFile.user_id == current_user["user_id"],
+    """Get file details for the current user."""
+    result = await db.execute(
+        select(UploadedFile).where(
+            UploadedFile.id == file_id,
+            UploadedFile.user_id == current_user["user_id"],
+        )
     )
-    result = await db.execute(stmt)
     file_record = result.scalar_one_or_none()
-
     if not file_record:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=404, detail="文件不存在")
+        raise HTTPException(status_code=404, detail="File not found")
 
     return FileInfoResponse(
         file_id=file_record.id,
@@ -170,40 +199,34 @@ async def list_files(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """获取用户文件列表。"""
-    user_id = current_user["user_id"]
-    conditions = [UploadedFile.user_id == user_id]
+    """List files for the current user."""
+    conditions = [UploadedFile.user_id == current_user["user_id"]]
     if conversation_id:
         conditions.append(UploadedFile.conversation_id == conversation_id)
 
-    # 总数
-    count_stmt = select(func.count(UploadedFile.id)).where(*conditions)
-    total = (await db.execute(count_stmt)).scalar() or 0
-
-    # 分页数据
+    total = (await db.execute(select(func.count(UploadedFile.id)).where(*conditions))).scalar() or 0
     offset = (page - 1) * page_size
-    stmt = (
+    result = await db.execute(
         select(UploadedFile)
         .where(*conditions)
         .order_by(UploadedFile.created_at.desc())
         .offset(offset)
         .limit(page_size)
     )
-    result = await db.execute(stmt)
     files = result.scalars().all()
 
     return FileListResponse(
         files=[
             FileUploadResponse(
-                file_id=f.id,
-                original_name=f.original_name,
-                file_type=f.file_type,
-                mime_type=f.mime_type,
-                file_size=f.file_size,
-                process_status=f.process_status,
-                created_at=f.created_at,
+                file_id=item.id,
+                original_name=item.original_name,
+                file_type=item.file_type,
+                mime_type=item.mime_type,
+                file_size=item.file_size,
+                process_status=item.process_status,
+                created_at=item.created_at,
             )
-            for f in files
+            for item in files
         ],
         total=total,
     )
@@ -215,31 +238,19 @@ async def delete_file_endpoint(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """删除文件（物理文件删除失败时记录日志但仍删除数据库记录）。"""
-    import logging
-    from app.services.file_processor.storage import delete_file as del_file
-
-    logger = logging.getLogger(__name__)
-
-    stmt = select(UploadedFile).where(
-        UploadedFile.id == file_id,
-        UploadedFile.user_id == current_user["user_id"],
-    )
-    result = await db.execute(stmt)
-    file_record = result.scalar_one_or_none()
-
-    if not file_record:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=404, detail="文件不存在")
-
-    # 删除物理文件（失败时记录但不阻塞）
-    storage_path = file_record.storage_path
-    file_deleted = del_file(storage_path)
-    if not file_deleted:
-        logger.warning(
-            f"[Files] 物理文件删除失败（可能已不存在）: "
-            f"file_id={file_id} path={storage_path}"
+    """Delete a user-owned file record and its stored file."""
+    result = await db.execute(
+        select(UploadedFile).where(
+            UploadedFile.id == file_id,
+            UploadedFile.user_id == current_user["user_id"],
         )
+    )
+    file_record = result.scalar_one_or_none()
+    if not file_record:
+        raise HTTPException(status_code=404, detail="File not found")
 
-    # 删除数据库记录
+    storage_path = file_record.storage_path
+    if not delete_stored_file(storage_path):
+        logger.warning("[Files] Stored file deletion failed or file missing: file_id=%s path=%s", file_id, storage_path)
+
     await db.delete(file_record)

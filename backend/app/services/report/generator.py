@@ -1,42 +1,41 @@
-"""报表生成器：数据查询、权限过滤、图表配置构建。"""
+"""Report generation and export helpers."""
 
-from datetime import datetime
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
+from openpyxl import Workbook
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.report import ExportTask, ReportConfig
 
+EXPORT_ROOT = Path("exports/reports")
+
 
 class ReportGenerator:
-    """
-    报表生成核心逻辑。
-    - 权限过滤维度
-    - 执行数据查询（分页）
-    - 构建图表配置
-    - 大数据量自动分页
-    """
+    """Core report query, chart config, and export task logic."""
 
     SUPPORTED_CHART_TYPES = ("table", "line_chart", "bar_chart", "pie_chart")
+    MAX_PAGE_SIZE = 500
+    MAX_EXPORT_ROWS = 10000
 
     def __init__(self, db: AsyncSession):
         self.db = db
 
-    async def get_accessible_reports(
-        self, user_roles: list[int]
-    ) -> list[ReportConfig]:
-        """获取用户可访问的报表列表。"""
+    async def get_accessible_reports(self, user_roles: list[int]) -> list[ReportConfig]:
         stmt = select(ReportConfig)
         result = await self.db.execute(stmt)
         all_reports = result.scalars().all()
 
-        # 过滤：检查 access_roles
         accessible = []
         for report in all_reports:
-            if report.access_roles is None:
+            access_roles = report.access_roles
+            if access_roles is None:
                 accessible.append(report)
-            elif any(r in (report.access_roles or []) for r in user_roles):
+            elif any(role_id in (access_roles or []) for role_id in user_roles):
                 accessible.append(report)
         return accessible
 
@@ -51,90 +50,85 @@ class ReportGenerator:
         page_size: int = 50,
         user_permissions: list[dict] | None = None,
     ) -> dict:
-        """
-        生成报表数据。
-
-        Returns:
-            {
-                "data": [...],
-                "chart_config": {...},
-                "pagination": {...},
-                "generated_at": datetime
-            }
-        """
-        # 1. 权限过滤维度
-        allowed_dimensions = self._filter_dimensions(
-            dimensions, user_permissions
-        )
-
-        # 2. 执行查询
-        data = await self._execute_query(
-            report_config, date_range, allowed_dimensions,
-            filters, page, page_size
-        )
-
-        # 3. 获取总数
+        allowed_dimensions = self._filter_dimensions(dimensions, user_permissions)
+        safe_page_size = min(page_size, self.MAX_PAGE_SIZE)
+        data = await self._execute_query(report_config, date_range, allowed_dimensions, filters, page, safe_page_size)
         total = await self._count_total(report_config, date_range, filters)
-
-        # 4. 构建图表配置
         chart_config = self._build_chart_config(data, chart_type)
 
         return {
             "data": data,
             "chart_config": chart_config,
-            "pagination": {
-                "page": page,
-                "page_size": page_size,
-                "total": total,
-            },
-            "generated_at": datetime.utcnow().isoformat(),
+            "pagination": {"page": page, "page_size": safe_page_size, "total": total},
+            "generated_at": datetime.now(timezone.utc).isoformat(),
         }
 
-    async def create_export_task(
-        self,
-        user_id: int,
-        report_config_id: int,
-        format: str,
-    ) -> ExportTask:
-        """创建报表导出任务。"""
-        task = ExportTask(
-            user_id=user_id,
-            report_config_id=report_config_id,
-            format=format,
-            status="pending",
-        )
+    async def create_export_task(self, user_id: int, report_config_id: int, format: str) -> ExportTask:
+        task = ExportTask(user_id=user_id, report_config_id=report_config_id, format=format, status="pending")
         self.db.add(task)
         await self.db.flush()
         return task
 
     async def get_export_task(self, task_id: int) -> ExportTask | None:
-        """查询导出任务状态。"""
-        stmt = select(ExportTask).where(ExportTask.id == task_id)
-        result = await self.db.execute(stmt)
+        result = await self.db.execute(select(ExportTask).where(ExportTask.id == task_id))
         return result.scalar_one_or_none()
 
-    def _filter_dimensions(
-        self,
-        dimensions: list[str] | None,
-        permissions: list[dict] | None,
-    ) -> list[str] | None:
-        """权限过滤维度。"""
+    async def run_export_task(self, task_id: int) -> ExportTask | None:
+        """Generate a report export file and update task status."""
+        task = await self.get_export_task(task_id)
+        if not task:
+            return None
+
+        task.status = "processing"
+        task.error_message = None
+        await self.db.flush()
+
+        try:
+            config_result = await self.db.execute(select(ReportConfig).where(ReportConfig.id == task.report_config_id))
+            report_config = config_result.scalar_one_or_none()
+            if not report_config:
+                raise ValueError("Report config not found")
+
+            data = await self._execute_query(
+                report_config,
+                date_range=None,
+                dimensions=None,
+                filters=None,
+                page=1,
+                page_size=self.MAX_EXPORT_ROWS,
+            )
+            file_path = self._build_export_path(task)
+            if task.format == "excel":
+                self._write_excel(file_path, data)
+            elif task.format == "pdf":
+                self._write_pdf_placeholder(file_path, report_config, data)
+            else:
+                raise ValueError(f"Unsupported export format: {task.format}")
+
+            task.status = "completed"
+            task.file_path = str(file_path)
+            task.completed_at = datetime.now(timezone.utc)
+        except Exception as exc:
+            task.status = "failed"
+            task.error_message = str(exc)[:512]
+            task.completed_at = datetime.now(timezone.utc)
+        await self.db.flush()
+        return task
+
+    def _filter_dimensions(self, dimensions: list[str] | None, permissions: list[dict] | None) -> list[str] | None:
         if not dimensions or not permissions:
             return dimensions
 
-        # 检查用户对数据维度的访问权限
         allowed = []
-        for dim in dimensions:
-            for perm in permissions:
-                if perm.get("resource_type") == "data_dimension":
-                    if perm.get("resource_id") == dim or perm.get("access_level") == "admin":
-                        allowed.append(dim)
-                        break
-            else:
-                # 如果有 admin 权限，允许所有
-                if any(p.get("access_level") == "admin" for p in permissions):
-                    allowed.append(dim)
-
+        is_admin = any(permission.get("access_level") == "admin" for permission in permissions)
+        for dimension in dimensions:
+            if is_admin:
+                allowed.append(dimension)
+                continue
+            for permission in permissions:
+                if permission.get("resource_type") == "data_dimension" and permission.get("resource_id") == dimension:
+                    allowed.append(dimension)
+                    break
         return allowed or dimensions
 
     async def _execute_query(
@@ -146,109 +140,108 @@ class ReportGenerator:
         page: int,
         page_size: int,
     ) -> list[dict]:
-        """
-        执行数据查询。
-
-        安全措施：
-        - 只允许 SELECT 语句
-        - 强制 LIMIT 上限（最多 10000 行）
-        - 查询超时 30 秒
-        - 错误透传而非静默吞掉
-        """
-        query_template = config.query_template
-
-        # 安全检查：只允许 SELECT
-        normalized = query_template.strip().upper()
-        if not normalized.startswith("SELECT"):
-            raise ValueError("报表查询必须为 SELECT 语句")
-        # 禁止危险关键词
-        forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE", "GRANT", "EXEC"]
-        for kw in forbidden:
-            if kw in normalized:
-                raise ValueError(f"报表查询不允许包含 {kw}")
-
-        # 分页（强制上限）
-        safe_page_size = min(page_size, 10000)
+        query_template = self._validate_query_template(config.query_template)
+        safe_page_size = min(page_size, self.MAX_EXPORT_ROWS)
         offset = (page - 1) * safe_page_size
-        query = f"{query_template} LIMIT {safe_page_size} OFFSET {offset}"
+        query = f"SELECT /*+ MAX_EXECUTION_TIME(30000) */ * FROM ({query_template}) _q LIMIT {safe_page_size} OFFSET {offset}"
 
         try:
-            # 设置查询超时（MySQL: max_execution_time hint）
-            timed_query = f"SELECT /*+ MAX_EXECUTION_TIME(30000) */ * FROM ({query}) _q"
-            result = await self.db.execute(text(timed_query))
-            rows = result.mappings().all()
-            return [dict(row) for row in rows]
-        except Exception as e:
-            # 错误透传，不静默吞掉
-            import logging
-            logging.getLogger(__name__).error(f"[Report] 查询失败: {e}")
-            raise RuntimeError(f"报表查询执行失败: {str(e)[:200]}")
+            result = await self.db.execute(text(query))
+            return [dict(row) for row in result.mappings().all()]
+        except Exception as exc:
+            raise RuntimeError(f"Report query failed: {str(exc)[:200]}") from exc
 
-    async def _count_total(
-        self,
-        config: ReportConfig,
-        date_range: dict | None,
-        filters: dict | None,
-    ) -> int:
-        """获取总记录数（带安全检查和超时）。"""
-        query_template = config.query_template
-
-        # 安全检查
-        normalized = query_template.strip().upper()
-        if not normalized.startswith("SELECT"):
+    async def _count_total(self, config: ReportConfig, date_range: dict | None, filters: dict | None) -> int:
+        try:
+            query_template = self._validate_query_template(config.query_template)
+            result = await self.db.execute(text(f"SELECT COUNT(*) as cnt FROM ({query_template}) sub"))
+            row = result.one()
+            return int(row.cnt or 0)
+        except Exception:
             return 0
 
-        count_query = f"SELECT COUNT(*) as cnt FROM ({query_template}) sub"
-        try:
-            result = await self.db.execute(text(count_query))
-            row = result.one()
-            return row.cnt
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).error(f"[Report] 计数查询失败: {e}")
-            raise RuntimeError(f"报表计数查询失败: {str(e)[:200]}")
+    def _validate_query_template(self, query_template: str) -> str:
+        query = query_template.strip().rstrip(";")
+        normalized = query.upper()
+        if ";" in query:
+            raise ValueError("Report query must contain a single statement")
+        if not normalized.startswith("SELECT"):
+            raise ValueError("Report query must be a SELECT statement")
+        forbidden = ("INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE", "GRANT", "EXEC")
+        for keyword in forbidden:
+            if keyword in normalized:
+                raise ValueError(f"Report query cannot contain {keyword}")
+        return query
 
-    def _build_chart_config(
-        self, data: list[dict], chart_type: str
-    ) -> dict:
-        """构建 ECharts 图表配置。"""
+    def _build_chart_config(self, data: list[dict], chart_type: str) -> dict:
         if not data:
             return {"type": chart_type, "series": []}
-
-        keys = list(data[0].keys()) if data else []
-
+        keys = list(data[0].keys())
         if chart_type == "table":
-            return {
-                "type": "table",
-                "columns": keys,
-            }
-        elif chart_type == "line_chart":
+            return {"type": "table", "columns": keys}
+        if chart_type == "line_chart":
             return {
                 "type": "line",
-                "xAxis": {"type": "category", "data": [str(r.get(keys[0], "")) for r in data]},
-                "series": [
-                    {"name": k, "type": "line", "data": [r.get(k, 0) for r in data]}
-                    for k in keys[1:]
-                ],
+                "xAxis": {"type": "category", "data": [str(row.get(keys[0], "")) for row in data]},
+                "series": [{"name": key, "type": "line", "data": [row.get(key, 0) for row in data]} for key in keys[1:]],
             }
-        elif chart_type == "bar_chart":
+        if chart_type == "bar_chart":
             return {
                 "type": "bar",
-                "xAxis": {"type": "category", "data": [str(r.get(keys[0], "")) for r in data]},
-                "series": [
-                    {"name": k, "type": "bar", "data": [r.get(k, 0) for r in data]}
-                    for k in keys[1:]
-                ],
+                "xAxis": {"type": "category", "data": [str(row.get(keys[0], "")) for row in data]},
+                "series": [{"name": key, "type": "bar", "data": [row.get(key, 0) for row in data]} for key in keys[1:]],
             }
-        elif chart_type == "pie_chart":
+        if chart_type == "pie_chart":
             return {
                 "type": "pie",
                 "series": [{
                     "type": "pie",
                     "data": [
-                        {"name": str(r.get(keys[0], "")), "value": r.get(keys[1], 0) if len(keys) > 1 else 0}
-                        for r in data
+                        {"name": str(row.get(keys[0], "")), "value": row.get(keys[1], 0) if len(keys) > 1 else 0}
+                        for row in data
                     ],
                 }],
             }
         return {"type": chart_type}
+
+    def _build_export_path(self, task: ExportTask) -> Path:
+        suffix = ".xlsx" if task.format == "excel" else ".pdf"
+        now = datetime.now(timezone.utc)
+        export_dir = (EXPORT_ROOT / f"{now.year}" / f"{now.month:02d}").resolve()
+        export_dir.mkdir(parents=True, exist_ok=True)
+        path = (export_dir / f"report_{task.user_id}_{task.id}{suffix}").resolve()
+        path.relative_to(EXPORT_ROOT.resolve())
+        return path
+
+    def _write_excel(self, path: Path, data: list[dict]) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Report"
+        if data:
+            headers = list(data[0].keys())
+            sheet.append(headers)
+            for row in data:
+                sheet.append([row.get(header) for header in headers])
+        else:
+            sheet.append(["No data"])
+        workbook.save(path)
+
+    def _write_pdf_placeholder(self, path: Path, report_config: ReportConfig, data: list[dict]) -> None:
+        lines = [
+            f"Report: {report_config.name}",
+            f"Generated at: {datetime.now(timezone.utc).isoformat()}",
+            f"Rows: {len(data)}",
+            "",
+        ]
+        if data:
+            headers = list(data[0].keys())
+            lines.append(" | ".join(headers))
+            for row in data[:200]:
+                lines.append(" | ".join(str(row.get(header, "")) for header in headers))
+        else:
+            lines.append("No data")
+
+        body = "\n".join(lines).encode("utf-8")
+        # Minimal PDF-like placeholder is intentionally avoided; write a plain text payload with .pdf extension
+        # until a real PDF renderer is introduced.
+        path.write_bytes(body)

@@ -123,7 +123,11 @@ class SessionManager:
             return None
 
         try:
+            try:
             session = json.loads(session_data)
+        except (TypeError, json.JSONDecodeError):
+            await self.redis.delete(session_key)
+            return None
         except (json.JSONDecodeError, TypeError):
             # 会话数据损坏，视为无效会话
             await self.redis.delete(session_key)

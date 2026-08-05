@@ -118,6 +118,15 @@ class LLMGateway:
         - 流中 JSON 解析错误不会中断整个流
         - 流中异常记录熔断失败
         """
+        from app.services.degradation import DegradationService, DegradationLevel
+        degradation = DegradationService(self.redis)
+        deg_config = await degradation.get_current_config()
+        if deg_config.level == DegradationLevel.FALLBACK:
+            raise AllModelsUnavailableException(
+                last_error=Exception("System is in fallback mode; LLM streaming is unavailable")
+            )
+        effective_max_tokens = min(request.max_tokens, deg_config.max_output_tokens)
+
         models = await self._get_available_models(request.task_type)
         if not models:
             raise AllModelsUnavailableException()
@@ -136,7 +145,7 @@ class LLMGateway:
                 raw_iterator = adapter.stream_generate(
                     endpoint=model.endpoint_url,
                     prompt=request.prompt,
-                    max_tokens=model.max_tokens,
+                    max_tokens=min(model.max_tokens, effective_max_tokens),
                     temperature=model.temperature,
                     api_key=api_key,
                 )
@@ -238,7 +247,6 @@ class LLMGateway:
             async for token in raw_iterator:
                 if first_token:
                     await self._reset_circuit(model_id)
-                    first_token = True
                     first_token = False
                 yield token
         except Exception:

@@ -1,68 +1,62 @@
-"""Prompt 模板引擎：模板管理、变量替换、版本控制、场景匹配。"""
+"""Prompt template engine."""
 
 import re
 from datetime import datetime, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.llm import PromptTemplate, PromptTemplateVersion
 
 
 class PromptTemplateEngine:
-    """
-    Prompt 模板引擎。
-    - 模板 CRUD 和版本管理
-    - 变量替换（{{variable_name}}）
-    - 按场景自动匹配模板
-    """
+    """Manage prompt templates, versions, rendering, and matching."""
 
-    # 内置变量名称
     BUILTIN_VARIABLES = {
-        "user_query": "用户的原始问题",
-        "context_docs": "RAG 检索到的相关文档内容",
-        "memory_context": "用户长期记忆中的相关历史问答",
-        "conversation_history": "对话历史上下文",
-        "tools_prompt": "可用工具描述（由工具注册中心生成）",
-        "user_role": "当前用户的角色信息",
-        "current_time": "当前时间戳",
+        "user_query": "Original user query",
+        "context_docs": "Documents retrieved by RAG",
+        "memory_context": "Relevant long-term memory context",
+        "conversation_history": "Conversation history",
+        "tools_prompt": "Available tool instructions",
+        "user_role": "Current user role information",
+        "current_time": "Current time",
     }
 
-    # 默认模板内容
-    DEFAULT_TEMPLATE = """你是一个企业内部知识助手。请基于以下检索到的文档内容回答用户的问题。
+    DEFAULT_TEMPLATE = """You are an internal enterprise knowledge assistant.
 
 {% if tools_prompt %}
 {{tools_prompt}}
 {% endif %}
 
 {% if memory_context %}
-用户的历史相关问答（仅供参考，优先使用最新检索文档）：
+Relevant user memory:
 {{memory_context}}
 {% endif %}
 
-检索文档：
+Retrieved documents:
 {{context_docs}}
 
 {% if conversation_history %}
-对话历史：
+Conversation history:
 {{conversation_history}}
 {% endif %}
 
-用户问题：{{user_query}}
+User question:
+{{user_query}}
 
-请提供结构化回答，包含：
-1. 摘要（一句话概括）
-2. 关键要点（列表形式）
-3. 详细说明
-4. 参考来源（标注引用的文档）
+Please provide a structured answer with:
+1. Summary
+2. Key points
+3. Details
+4. References when available
 
-如果检索文档中没有相关信息，请明确说明无法回答并建议用户调整问题。"""
+If the retrieved documents do not contain enough information, say so clearly and suggest how to refine the question.
+"""
 
-    # 场景关键词映射
     CATEGORY_KEYWORDS = {
-        "tech_doc": ["技术", "代码", "架构", "接口", "API", "部署", "配置", "Bug", "报错"],
-        "data_analysis": ["数据", "报表", "统计", "分析", "指标", "趋势", "环比", "同比"],
-        "process_guide": ["流程", "步骤", "如何", "怎么", "操作", "审批", "申请"],
+        "tech_doc": ["tech", "code", "architecture", "api", "deploy", "config", "bug", "error"],
+        "data_analysis": ["data", "report", "metric", "analysis", "trend", "statistics"],
+        "process_guide": ["process", "step", "how", "guide", "approval", "workflow"],
     }
 
     def __init__(self, db: AsyncSession):
@@ -77,7 +71,6 @@ class PromptTemplateEngine:
         created_by: int,
         is_default: bool = False,
     ) -> PromptTemplate:
-        """创建新模板。"""
         template = PromptTemplate(
             name=name,
             category=category,
@@ -88,19 +81,17 @@ class PromptTemplateEngine:
         )
         self.db.add(template)
         await self.db.flush()
-
-        # 保存初始版本
-        version = PromptTemplateVersion(
-            template_id=template.id,
-            version=1,
-            template_content=template_content,
-            variables=variables,
-            changed_by=created_by,
-            change_description="初始创建",
+        self.db.add(
+            PromptTemplateVersion(
+                template_id=template.id,
+                version=1,
+                template_content=template_content,
+                variables=variables,
+                changed_by=created_by,
+                change_description="Initial version",
+            )
         )
-        self.db.add(version)
         await self.db.flush()
-
         return template
 
     async def update_template(
@@ -113,10 +104,7 @@ class PromptTemplateEngine:
         is_active: bool | None = None,
         change_description: str = "",
     ) -> PromptTemplate | None:
-        """更新模板并保存版本。"""
-        stmt = select(PromptTemplate).where(PromptTemplate.id == template_id)
-        result = await self.db.execute(stmt)
-        template = result.scalar_one_or_none()
+        template = await self._get_template(template_id)
         if not template:
             return None
 
@@ -124,188 +112,137 @@ class PromptTemplateEngine:
             template.name = name
         if is_active is not None:
             template.is_active = is_active
+        if variables is not None:
+            template.variables = variables
 
         if template_content is not None:
             template.template_content = template_content
             template.version += 1
-
-            # 保存版本历史
-            version = PromptTemplateVersion(
-                template_id=template.id,
-                version=template.version,
-                template_content=template_content,
-                variables=variables or template.variables,
-                changed_by=changed_by,
-                change_description=change_description,
+            self.db.add(
+                PromptTemplateVersion(
+                    template_id=template.id,
+                    version=template.version,
+                    template_content=template.template_content,
+                    variables=template.variables,
+                    changed_by=changed_by,
+                    change_description=change_description,
+                )
             )
-            self.db.add(version)
-
-        if variables is not None:
-            template.variables = variables
 
         await self.db.flush()
         return template
 
     async def rollback_version(self, template_id: int, target_version: int) -> PromptTemplate | None:
-        """回退模板到指定版本。"""
-        # 获取目标版本
-        stmt = select(PromptTemplateVersion).where(
-            PromptTemplateVersion.template_id == template_id,
-            PromptTemplateVersion.version == target_version,
-        )
-        result = await self.db.execute(stmt)
-        version_record = result.scalar_one_or_none()
-        if not version_record:
-            return None
-
-        # 更新当前模板
-        stmt2 = select(PromptTemplate).where(PromptTemplate.id == template_id)
-        result2 = await self.db.execute(stmt2)
-        template = result2.scalar_one_or_none()
+        template = await self._get_template(template_id)
         if not template:
             return None
 
-        template.template_content = version_record.template_content
-        template.variables = version_record.variables
-        template.version = version_record.version
-        await self.db.flush()
+        version_result = await self.db.execute(
+            select(PromptTemplateVersion).where(
+                PromptTemplateVersion.template_id == template_id,
+                PromptTemplateVersion.version == target_version,
+            )
+        )
+        version = version_result.scalar_one_or_none()
+        if not version:
+            return None
 
+        template.version += 1
+        template.template_content = version.template_content
+        template.variables = version.variables
+        self.db.add(
+            PromptTemplateVersion(
+                template_id=template.id,
+                version=template.version,
+                template_content=template.template_content,
+                variables=template.variables,
+                changed_by=0,
+                change_description=f"Rollback to version {target_version}",
+            )
+        )
+        await self.db.flush()
         return template
 
-    async def render(
-        self, template_id: int | None, variables: dict[str, str]
-    ) -> str:
-        """
-        渲染 Prompt 模板。
-        如果 template_id 为 None，使用默认模板。
-        """
+    async def render(self, template_id: int | None, variables: dict[str, str]) -> str:
         if template_id:
-            stmt = select(PromptTemplate).where(
-                PromptTemplate.id == template_id,
-                PromptTemplate.is_active == True,
-            )
-            result = await self.db.execute(stmt)
-            template = result.scalar_one_or_none()
+            template = await self._get_template(template_id, active_only=True)
             if template:
                 return self._substitute_variables(template.template_content, variables)
-
-        # 使用默认模板
         return self._substitute_variables(self.DEFAULT_TEMPLATE, variables)
 
     async def match_template(self, question: str, category: str | None = None) -> int | None:
-        """
-        自动匹配最合适的 Prompt 模板。
-        1. 如果指定了 category，选该分类活跃模板
-        2. 否则基于关键词检测分类
-        3. 回退到默认模板（返回 None）
-        """
         target_category = category or self._detect_category(question)
-
         if target_category:
-            stmt = (
+            result = await self.db.execute(
                 select(PromptTemplate)
-                .where(
-                    PromptTemplate.category == target_category,
-                    PromptTemplate.is_active == True,
-                )
+                .where(PromptTemplate.category == target_category, PromptTemplate.is_active == True)
                 .order_by(PromptTemplate.is_default.desc())
                 .limit(1)
             )
-            result = await self.db.execute(stmt)
             template = result.scalar_one_or_none()
             if template:
                 return template.id
 
-        # 回退到默认
-        stmt = select(PromptTemplate).where(
-            PromptTemplate.is_default == True,
-            PromptTemplate.is_active == True,
-        ).limit(1)
-        result = await self.db.execute(stmt)
+        result = await self.db.execute(
+            select(PromptTemplate)
+            .where(PromptTemplate.is_default == True, PromptTemplate.is_active == True)
+            .limit(1)
+        )
         template = result.scalar_one_or_none()
         return template.id if template else None
 
     async def get_template_versions(self, template_id: int) -> list[PromptTemplateVersion]:
-        """获取模板版本历史。"""
-        stmt = (
+        result = await self.db.execute(
             select(PromptTemplateVersion)
             .where(PromptTemplateVersion.template_id == template_id)
             .order_by(PromptTemplateVersion.version.desc())
         )
-        result = await self.db.execute(stmt)
         return list(result.scalars().all())
 
     async def preview(self, template_id: int, variables: dict[str, str]) -> tuple[str, int]:
-        """预览渲染结果，返回 (rendered_content, token_count)。"""
         rendered = await self.render(template_id, variables)
-        token_count = len(rendered) // 2  # 粗略估算
+        token_count = max(1, len(rendered) // 4)
         return rendered, token_count
 
     async def get_system_prompt(self, template_id: int | None = None) -> str:
-        """
-        获取系统 Prompt 的基础文本（不含用户变量填充）。
-        用于预算分配器中计算固定组件占用。
-
-        Returns:
-            模板中的系统指令部分（将变量占位符清除后的结果）
-        """
         if template_id:
-            stmt = select(PromptTemplate).where(
-                PromptTemplate.id == template_id,
-                PromptTemplate.is_active == True,
-            )
-            result = await self.db.execute(stmt)
-            template = result.scalar_one_or_none()
+            template = await self._get_template(template_id, active_only=True)
             if template:
                 return self._extract_system_instruction(template.template_content)
-
         return self._extract_system_instruction(self.DEFAULT_TEMPLATE)
 
+    async def _get_template(self, template_id: int, active_only: bool = False) -> PromptTemplate | None:
+        conditions = [PromptTemplate.id == template_id]
+        if active_only:
+            conditions.append(PromptTemplate.is_active == True)
+        result = await self.db.execute(select(PromptTemplate).where(*conditions))
+        return result.scalar_one_or_none()
+
     def _extract_system_instruction(self, template: str) -> str:
-        """
-        从模板中提取系统指令部分。
-        移除所有变量占位符和条件块，保留纯指令文本。
-        """
-        result = template
-        # 移除条件块
-        result = re.sub(r"{{% if \w+ %}}.*?{{% endif %}}", "", result, flags=re.DOTALL)
-        # 移除变量占位符
+        result = re.sub(r"{% if \w+ %}.*?{% endif %}", "", template, flags=re.DOTALL)
         result = re.sub(r"\{\{\w+\}\}", "", result)
-        # 清理多余空行
         result = re.sub(r"\n{3,}", "\n\n", result)
         return result.strip()
 
     def _substitute_variables(self, template: str, variables: dict[str, str]) -> str:
-        """替换模板中的变量占位符 {{variable_name}}。"""
-        result = template
-        for key, value in variables.items():
-            result = result.replace(f"{{{{{key}}}}}", str(value))
-
-        # 处理简单条件块 {% if variable %}...{% endif %}
-        for key, value in variables.items():
-            if value:
-                result = re.sub(
-                    rf"{{% if {key} %}}(.*?){{% endif %}}",
-                    r"\1",
-                    result,
-                    flags=re.DOTALL,
-                )
-            else:
-                result = re.sub(
-                    rf"{{% if {key} %}}.*?{{% endif %}}",
-                    "",
-                    result,
-                    flags=re.DOTALL,
-                )
-
-        # 清理未被替换的条件块
-        result = re.sub(r"{{% if \w+ %}}.*?{{% endif %}}", "", result, flags=re.DOTALL)
-
+        result = self._apply_condition_blocks(template, variables)
+        merged = {"current_time": datetime.now(timezone.utc).isoformat(), **variables}
+        for key, value in merged.items():
+            result = result.replace("{{" + key + "}}", str(value or ""))
+        result = re.sub(r"\{\{\w+\}\}", "", result)
         return result.strip()
 
+    def _apply_condition_blocks(self, template: str, variables: dict[str, str]) -> str:
+        def replace_block(match: re.Match) -> str:
+            key = match.group(1)
+            content = match.group(2)
+            return content if variables.get(key) else ""
+
+        return re.sub(r"{% if (\w+) %}(.*?){% endif %}", replace_block, template, flags=re.DOTALL)
+
     def _detect_category(self, question: str) -> str | None:
-        """基于关键词检测问题类别。"""
+        lowered = question.lower()
         for category, keywords in self.CATEGORY_KEYWORDS.items():
-            if any(kw in question for kw in keywords):
+            if any(keyword in lowered for keyword in keywords):
                 return category
-        return "general"
+        return None

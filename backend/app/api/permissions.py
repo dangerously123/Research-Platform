@@ -71,6 +71,7 @@ async def remove_role(
     # 清除缓存
     calculator = PermissionCalculator(db=db, redis=redis)
     await calculator.invalidate_cache(user_id)
+    await redis.incr(f"rag:permission:version:{user_id}")
 
 
 @router.get("/{user_id}/effective-permissions", response_model=EffectivePermissionResponse)

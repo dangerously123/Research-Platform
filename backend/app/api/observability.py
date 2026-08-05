@@ -1,4 +1,4 @@
-"""可观测性 API：Agent 执行轨迹查询、统计。"""
+"""Observability API for Agent traces and stats."""
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,7 +19,7 @@ async def list_traces(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """获取当前用户的 Agent 执行轨迹列表。"""
+    """List Agent traces for the current user."""
     service = TraceQueryService(db)
     traces, total = await service.list_traces(
         user_id=current_user["user_id"],
@@ -37,17 +37,15 @@ async def get_trace_detail(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """获取单条轨迹详情（校验用户归属）。"""
+    """Get one trace detail for the trace owner only."""
     service = TraceQueryService(db)
     result = await service.get_trace(trace_id)
     if not result:
-        raise HTTPException(status_code=404, detail="轨迹不存在")
+        raise HTTPException(status_code=404, detail="Trace not found")
 
-    # 归属校验：只能查看自己的轨迹（管理员除外）
     trace_user_id = result["trace"].get("user_id")
-    is_admin = "admin" in current_user.get("roles", [])
-    if trace_user_id != current_user["user_id"] and not is_admin:
-        raise HTTPException(status_code=403, detail="无权查看该轨迹")
+    if trace_user_id != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="Trace access denied")
 
     return result
 
@@ -58,10 +56,6 @@ async def get_observability_stats(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """获取可观测性统计摘要（仅当前用户数据）。"""
+    """Get observability stats for the current user."""
     service = TraceQueryService(db)
-    stats = await service.get_stats(
-        user_id=current_user["user_id"],
-        days=days,
-    )
-    return stats
+    return await service.get_stats(user_id=current_user["user_id"], days=days)

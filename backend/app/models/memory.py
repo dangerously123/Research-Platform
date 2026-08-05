@@ -1,19 +1,8 @@
-"""用户记忆相关数据库模型。"""
+"""Database model for user memories."""
 
 from datetime import datetime
 
-from sqlalchemy import (
-    BigInteger,
-    Boolean,
-    DateTime,
-    Float,
-    ForeignKey,
-    Index,
-    Integer,
-    String,
-    Text,
-    func,
-)
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.dialects.mysql import JSON
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -21,56 +10,24 @@ from app.core.database import Base
 
 
 class MemoryRecord(Base):
-    """
-    用户记忆元数据表。
-    向量数据存储在 ChromaDB/Milvus 中，此表存储结构化元数据供管理和展示。
-    """
+    """Structured metadata for user memories stored in the vector database."""
 
     __tablename__ = "memory_records"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
-    )
-    # 记忆内容
-    question: Mapped[str] = mapped_column(Text, nullable=False, comment="用户原始问题")
-    answer_summary: Mapped[str] = mapped_column(
-        Text, nullable=False, comment="回答摘要（200字以内）"
-    )
-    key_facts: Mapped[dict | None] = mapped_column(
-        JSON, comment="从回答中提取的关键事实列表"
-    )
-    topic_tags: Mapped[str | None] = mapped_column(
-        String(256), comment="主题标签，逗号分隔"
-    )
-
-    # 记忆管理
-    importance: Mapped[float] = mapped_column(
-        Float, default=0.5, comment="重要性评分 0-1"
-    )
-    access_count: Mapped[int] = mapped_column(
-        Integer, default=0, comment="被回忆引用次数"
-    )
-    vector_id: Mapped[str] = mapped_column(
-        String(128), nullable=False, comment="向量库中的记录ID"
-    )
-
-    # 来源追踪
-    conversation_id: Mapped[int | None] = mapped_column(
-        BigInteger, comment="来源会话ID"
-    )
-    source_message_id: Mapped[int | None] = mapped_column(
-        BigInteger, comment="来源消息ID"
-    )
-
-    # 时间管理
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    question: Mapped[str] = mapped_column(Text, nullable=False, comment="Original user question")
+    answer_summary: Mapped[str] = mapped_column(Text, nullable=False, comment="Short answer summary")
+    key_facts: Mapped[list | None] = mapped_column(JSON, comment="Extracted key facts")
+    topic_tags: Mapped[str | None] = mapped_column(String(256), comment="Comma-separated topic tags")
+    importance: Mapped[float] = mapped_column(Float, default=0.5, comment="Importance score from 0 to 1")
+    access_count: Mapped[int] = mapped_column(Integer, default=0, comment="Recall count")
+    vector_id: Mapped[str] = mapped_column(String(128), nullable=False, comment="Vector-store record id")
+    conversation_id: Mapped[int | None] = mapped_column(BigInteger, comment="Source conversation id")
+    source_message_id: Mapped[int | None] = mapped_column(BigInteger, comment="Source message id")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    last_accessed_at: Mapped[datetime | None] = mapped_column(
-        DateTime, comment="最后被引用时间"
-    )
-    expires_at: Mapped[datetime | None] = mapped_column(
-        DateTime, comment="过期时间（可选，实现记忆衰减）"
-    )
+    last_accessed_at: Mapped[datetime | None] = mapped_column(DateTime, comment="Last recall time")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, comment="Optional expiry time")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     __table_args__ = (
