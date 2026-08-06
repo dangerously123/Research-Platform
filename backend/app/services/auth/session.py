@@ -1,4 +1,4 @@
-"""会话管理器：登录认证、会话验证、活跃时间刷新。"""
+﻿"""Session management: login authentication, session validation, and session refresh."""
 
 import json
 from datetime import datetime, timedelta, timezone
@@ -23,10 +23,10 @@ from app.services.auth.password import verify_password
 
 class SessionManager:
     """
-    会话管理器。
-    - 处理用户登录认证
-    - 管理 Redis 会话存储
-    - 处理会话超时和刷新
+    浼氳瘽绠＄悊鍣ㄣ€?
+    - 澶勭悊鐢ㄦ埛鐧诲綍璁よ瘉
+    - 绠＄悊 Redis 浼氳瘽瀛樺偍
+    - 澶勭悊浼氳瘽瓒呮椂鍜屽埛鏂?
     """
 
     def __init__(self, db: AsyncSession, redis: aioredis.Redis):
@@ -35,17 +35,17 @@ class SessionManager:
 
     async def authenticate(self, username: str, password: str) -> dict:
         """
-        用户认证流程：
-        1. 检查用户是否存在
-        2. 检查账号锁定状态
-        3. 验证密码
-        4. 检查登录失败次数（锁定逻辑）
-        5. 签发 Token 并存储会话
+        鐢ㄦ埛璁よ瘉娴佺▼锛?
+        1. 妫€鏌ョ敤鎴锋槸鍚﹀瓨鍦?
+        2. 妫€鏌ヨ处鍙烽攣瀹氱姸鎬?
+        3. 楠岃瘉瀵嗙爜
+        4. 妫€鏌ョ櫥褰曞け璐ユ鏁帮紙閿佸畾閫昏緫锛?
+        5. 绛惧彂 Token 骞跺瓨鍌ㄤ細璇?
 
         Returns:
             dict: {"access_token": str, "token_type": str, "expires_in": int, "user": dict}
         """
-        # 查询用户
+        # 鏌ヨ鐢ㄦ埛
         stmt = (
             select(User)
             .options(selectinload(User.user_roles).selectinload(UserRole.role))
@@ -54,32 +54,32 @@ class SessionManager:
         result = await self.db.execute(stmt)
         user = result.scalar_one_or_none()
 
-        # 检查锁定状态
+        # 妫€鏌ラ攣瀹氱姸鎬?
         if user and user.locked_until:
             if user.locked_until > datetime.now(timezone.utc):
                 raise AuthenticationException(AUTH_002)
 
-        # 验证密码
+        # 楠岃瘉瀵嗙爜
         if not user or not verify_password(password, user.password_hash):
-            # 记录失败次数
+            # 璁板綍澶辫触娆℃暟
             if user:
                 await self._record_failed_attempt(user)
             raise AuthenticationException(AUTH_001)
 
-        # 检查用户状态
+        # 妫€鏌ョ敤鎴风姸鎬?
         if user.status == "disabled":
             raise AuthenticationException(AUTH_001)
 
-        # 登录成功，重置失败计数
+        # 鐧诲綍鎴愬姛锛岄噸缃け璐ヨ鏁?
         await self._reset_failed_attempts(user)
 
-        # 获取用户角色 ID 列表
+        # 鑾峰彇鐢ㄦ埛瑙掕壊 ID 鍒楄〃
         role_ids = [ur.role_id for ur in user.user_roles]
 
-        # 签发 Token
+        # 绛惧彂 Token
         token, token_id = create_access_token(user_id=user.id, roles=role_ids)
 
-        # 存储会话到 Redis
+        # 瀛樺偍浼氳瘽鍒?Redis
         await self._store_session(token_id, user)
 
         return {
@@ -98,16 +98,16 @@ class SessionManager:
 
     async def validate_session(self, token: str) -> dict | None:
         """
-        验证会话有效性：
-        1. 解码 JWT
-        2. 检查 Redis 中会话是否存在
-        3. 检查会话是否超时
-        4. 刷新活跃时间
+        楠岃瘉浼氳瘽鏈夋晥鎬э細
+        1. 瑙ｇ爜 JWT
+        2. 妫€鏌?Redis 涓細璇濇槸鍚﹀瓨鍦?
+        3. 妫€鏌ヤ細璇濇槸鍚﹁秴鏃?
+        4. 鍒锋柊娲昏穬鏃堕棿
 
         Returns:
-            会话数据 dict 或 None
+            浼氳瘽鏁版嵁 dict 鎴?None
         """
-        # 解码 Token
+        # 瑙ｇ爜 Token
         payload = decode_access_token(token)
         if not payload:
             return None
@@ -116,31 +116,27 @@ class SessionManager:
         if not token_id:
             return None
 
-        # 检查 Redis 会话
+        # 妫€鏌?Redis 浼氳瘽
         session_key = f"session:{token_id}"
         session_data = await self.redis.get(session_key)
         if not session_data:
             return None
 
         try:
-            try:
             session = json.loads(session_data)
         except (TypeError, json.JSONDecodeError):
-            await self.redis.delete(session_key)
-            return None
-        except (json.JSONDecodeError, TypeError):
-            # 会话数据损坏，视为无效会话
+            # 浼氳瘽鏁版嵁鎹熷潖锛岃涓烘棤鏁堜細璇?
             await self.redis.delete(session_key)
             return None
 
-        # 检查会话超时（30 分钟无操作）
+        # 妫€鏌ヤ細璇濊秴鏃讹紙30 鍒嗛挓鏃犳搷浣滐級
         last_active = datetime.fromisoformat(session["last_active"])
         timeout = timedelta(minutes=settings.SESSION_TIMEOUT_MINUTES)
         if datetime.now(timezone.utc) - last_active > timeout:
             await self.redis.delete(session_key)
             return None
 
-        # 刷新活跃时间
+        # 鍒锋柊娲昏穬鏃堕棿
         session["last_active"] = datetime.now(timezone.utc).isoformat()
         await self.redis.setex(
             session_key,
@@ -151,7 +147,7 @@ class SessionManager:
         return session
 
     async def logout(self, token: str) -> None:
-        """登出：删除 Redis 中的会话。"""
+        """Log out by deleting the Redis session."""
         payload = decode_access_token(token)
         if payload:
             token_id = payload.get("jti")
@@ -159,7 +155,7 @@ class SessionManager:
                 await self.redis.delete(f"session:{token_id}")
 
     async def _store_session(self, token_id: str, user: User) -> None:
-        """将会话信息存入 Redis。"""
+        """Store the session data in Redis."""
         session_data = {
             "user_id": user.id,
             "username": user.username,
@@ -174,17 +170,14 @@ class SessionManager:
         )
 
     async def _record_failed_attempt(self, user: User) -> None:
-        """
-        记录登录失败次数。
-        使用 Redis 计数器（1 分钟窗口），达到上限后锁定账号。
-        """
+        """Track failed login attempts and lock the account when needed."""
         key = f"login:attempts:{user.username}"
         count = await self.redis.incr(key)
         if count == 1:
-            await self.redis.expire(key, 60)  # 1 分钟窗口
+            await self.redis.expire(key, 60)  # 1 鍒嗛挓绐楀彛
 
         if count >= settings.MAX_LOGIN_ATTEMPTS:
-            # 锁定账号
+            # 閿佸畾璐﹀彿
             user.locked_until = datetime.now(timezone.utc) + timedelta(
                 minutes=settings.LOCKOUT_MINUTES
             )
@@ -193,7 +186,7 @@ class SessionManager:
             await self.db.flush()
 
     async def _reset_failed_attempts(self, user: User) -> None:
-        """登录成功，重置失败计数。"""
+        """Reset failed login counters after a successful login."""
         key = f"login:attempts:{user.username}"
         await self.redis.delete(key)
         if user.failed_login_count > 0:
@@ -202,3 +195,4 @@ class SessionManager:
             user.status = "active"
             user.locked_until = None
         await self.db.flush()
+

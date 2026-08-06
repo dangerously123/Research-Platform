@@ -27,6 +27,8 @@ class Settings(BaseSettings):
         description="Redis 连接 URL",
     )
     REDIS_MAX_CONNECTIONS: int = 50
+    AUTO_START_LOCAL_REDIS: bool = True
+    REDIS_SERVER_PATH: str = ""
 
     # JWT 认证配置
     JWT_SECRET_KEY: str = Field(

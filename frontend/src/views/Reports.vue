@@ -1,87 +1,117 @@
 <template>
-  <div class="reports-page">
-    <h3>Reports</h3>
-    <el-select
-      v-model="selectedReport"
-      placeholder="Select report"
-      :disabled="loadingReport || reportsLoading"
-      class="report-selector"
-      @change="loadReport"
-    >
-      <el-option v-for="report in reports" :key="report.id" :label="report.name" :value="report.id" />
-    </el-select>
-
-    <div v-if="loadingReport" class="loading-state">
-      <el-icon class="is-loading" :size="32"><Loading /></el-icon>
-      <p>Loading...</p>
+  <div class="page-shell reports-page">
+    <div class="page-header">
+      <div>
+        <h1 class="page-title">数据报表</h1>
+        <div class="page-subtitle">选择报表并生成分页数据，支持 Excel 与 PDF 导出。</div>
+      </div>
+      <div class="page-toolbar">
+        <el-button :loading="loading" :disabled="loading" @click="loadReports">刷新列表</el-button>
+        <el-button type="primary" :disabled="loading" @click="loadReport">重新生成</el-button>
+      </div>
     </div>
 
-    <el-alert
-      v-if="errorMsg"
-      :title="errorMsg"
-      type="error"
-      show-icon
-      closable
-      class="page-alert"
-      @close="errorMsg = ''"
-    />
+    <div class="metric-grid">
+      <div class="metric-card">
+        <div class="metric-label">报表数量</div>
+        <div class="metric-value">{{ reports.length }}</div>
+        <div class="metric-note">当前可访问的报表模板</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">当前页</div>
+        <div class="metric-value">{{ page }}</div>
+        <div class="metric-note">分页浏览中的页码</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">导出任务</div>
+        <div class="metric-value">{{ activeExport?.task_id || '-' }}</div>
+        <div class="metric-note">最近一次导出任务编号</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">导出状态</div>
+        <div class="metric-value">{{ activeExport?.status || 'idle' }}</div>
+        <div class="metric-note">当前导出任务状态</div>
+      </div>
+    </div>
 
-    <el-alert
-      v-if="activeExport"
-      :title="exportTitle"
-      :type="activeExport.status === 'failed' ? 'error' : 'info'"
-      show-icon
-      class="page-alert"
-      :closable="activeExport.status !== 'processing' && activeExport.status !== 'pending'"
-      @close="activeExport = null"
-    >
-      <template #default>
-        <el-button
-          v-if="activeExport.status === 'completed' && activeExport.download_url"
-          type="primary"
-          size="small"
-          @click="downloadExport(activeExport.download_url)"
+    <div class="page-panel workspace-panel">
+      <div class="toolbar-row">
+        <el-select
+          v-model="selectedReport"
+          placeholder="选择报表"
+          :disabled="loadingReport || reportsLoading"
+          class="report-selector"
+          @change="loadReport"
+          filterable
         >
-          Download
-        </el-button>
-      </template>
-    </el-alert>
+          <el-option v-for="report in reports" :key="report.id" :label="report.name" :value="report.id" />
+        </el-select>
 
-    <div v-if="reportData && !loadingReport" class="report-content">
-      <el-empty v-if="!reportData.data?.length" description="No data" />
-      <template v-else>
-        <el-table :data="reportData.data" border stripe class="report-table">
-          <el-table-column v-for="col in columns" :key="col" :prop="col" :label="col" show-overflow-tooltip />
-        </el-table>
+        <div class="soft-text">支持表格分页展示与异步导出</div>
+      </div>
 
-        <el-pagination
-          :current-page="page"
-          :page-size="pageSize"
-          :total="reportData.pagination?.total || 0"
-          :disabled="loadingReport"
-          layout="prev, pager, next"
-          class="pagination"
-          @current-change="changePage"
-        />
-      </template>
+      <div v-if="loadingReport" class="loading-state">
+        <el-icon class="is-loading" :size="32"><Loading /></el-icon>
+        <p>正在生成报表...</p>
+      </div>
 
-      <div class="actions">
-        <el-button
-          type="success"
-          :loading="exportingExcel"
-          :disabled="exportingExcel || exportingPdf || !reportData"
-          @click="exportReport('excel')"
-        >
-          Export Excel
-        </el-button>
-        <el-button
-          type="warning"
-          :loading="exportingPdf"
-          :disabled="exportingExcel || exportingPdf || !reportData"
-          @click="exportReport('pdf')"
-        >
-          Export PDF
-        </el-button>
+      <el-alert
+        v-if="activeExport"
+        :title="exportTitle"
+        :type="activeExport.status === 'failed' ? 'warning' : 'success'"
+        show-icon
+        class="page-alert"
+        :closable="activeExport.status !== 'processing' && activeExport.status !== 'pending'"
+        @close="activeExport = null"
+      >
+        <template #default>
+          <el-button
+            v-if="activeExport.status === 'completed' && activeExport.download_url"
+            type="primary"
+            size="small"
+            @click="downloadExport(activeExport.download_url)"
+          >
+            下载文件
+          </el-button>
+        </template>
+      </el-alert>
+
+      <div v-if="reportData && !loadingReport" class="report-content">
+        <el-empty v-if="!reportData.data?.length" description="暂无数据" />
+        <template v-else>
+          <el-table :data="reportData.data" border stripe class="report-table compact-table">
+            <el-table-column v-for="col in columns" :key="col" :prop="col" :label="col" show-overflow-tooltip />
+          </el-table>
+
+          <el-pagination
+            :current-page="page"
+            :page-size="pageSize"
+            :total="reportData.pagination?.total || 0"
+            :disabled="loadingReport"
+            layout="prev, pager, next"
+            class="pagination"
+            @current-change="changePage"
+          />
+        </template>
+
+        <div class="actions">
+          <el-button
+            type="success"
+            :loading="exportingExcel"
+            :disabled="exportingExcel || exportingPdf || !reportData"
+            @click="exportReport('excel')"
+          >
+            导出 Excel
+          </el-button>
+          <el-button
+            type="warning"
+            :loading="exportingPdf"
+            :disabled="exportingExcel || exportingPdf || !reportData"
+            @click="exportReport('pdf')"
+          >
+            导出 PDF
+          </el-button>
+        </div>
       </div>
     </div>
   </div>
@@ -90,8 +120,8 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed } from 'vue'
 import { Loading } from '@element-plus/icons-vue'
+import { ElMessage, ElNotification } from 'element-plus'
 import api from '@/utils/api'
-import { ElMessage } from 'element-plus'
 
 type ExportStatus = {
   task_id: number
@@ -113,6 +143,7 @@ const errorMsg = ref('')
 const activeExport = ref<ExportStatus | null>(null)
 let exportPollTimer: ReturnType<typeof window.setTimeout> | null = null
 let reportRequestId = 0
+const loading = computed(() => reportsLoading.value || loadingReport.value)
 
 const columns = computed(() => {
   if (reportData.value?.data?.length) return Object.keys(reportData.value.data[0])
@@ -138,6 +169,13 @@ async function loadReports() {
     reports.value = res.data.reports || []
   } catch (error: any) {
     errorMsg.value = error.response?.data?.message || 'Failed to load report list'
+    ElNotification({
+      title: '报表列表加载失败',
+      message: '可以稍后再刷新一次，或者检查后端服务是否正常。',
+      type: 'warning',
+      position: 'top-right',
+      duration: 4200,
+    })
   } finally {
     reportsLoading.value = false
   }
@@ -159,6 +197,13 @@ async function loadReport() {
     if (currentRequestId === reportRequestId) {
       reportData.value = null
       errorMsg.value = error.response?.data?.message || 'Failed to generate report'
+      ElNotification({
+        title: '报表生成失败',
+        message: '请稍后重试，或切换到其他报表继续查看。',
+        type: 'warning',
+        position: 'top-right',
+        duration: 4200,
+      })
     }
   } finally {
     if (currentRequestId === reportRequestId) loadingReport.value = false
@@ -179,10 +224,16 @@ async function exportReport(format: 'excel' | 'pdf') {
   try {
     const res = await api.post(`/reports/${selectedReport.value}/export`, { format })
     activeExport.value = res.data
-    ElMessage.success(`Export task #${res.data.task_id} created`)
+    ElMessage.success(`已创建导出任务 #${res.data.task_id}`)
     pollExportStatus(res.data.task_id)
   } catch (error: any) {
-    ElMessage.error(error.response?.data?.message || 'Failed to create export task')
+    ElNotification({
+      title: '导出创建失败',
+      message: '请重试一次，或稍后再导出该报表。',
+      type: 'warning',
+      position: 'top-right',
+      duration: 4200,
+    })
   } finally {
     loadingRef.value = false
   }
@@ -222,11 +273,47 @@ function downloadExport(downloadUrl: string) {
 </script>
 
 <style scoped>
-.reports-page { padding: 0 16px; }
-.report-selector { width: 300px; margin-bottom: 16px; }
-.loading-state { text-align: center; padding: 40px; }
-.page-alert { margin-bottom: 12px; }
-.report-table { width: 100%; margin-top: 16px; }
-.pagination { margin-top: 16px; }
-.actions { margin-top: 12px; }
+.reports-page {
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+.workspace-panel {
+  padding: 20px;
+}
+
+.toolbar-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.report-selector {
+  width: min(420px, 100%);
+}
+
+.loading-state {
+  display: grid;
+  place-items: center;
+  gap: 10px;
+  min-height: 180px;
+  color: var(--app-text-muted);
+}
+
+.report-table {
+  width: 100%;
+  margin-top: 16px;
+}
+
+.pagination {
+  margin-top: 16px;
+}
+
+.actions {
+  display: flex;
+  gap: 12px;
+  margin-top: 14px;
+}
 </style>

@@ -9,7 +9,7 @@ from app.core.config import settings
 from app.core.errors import AppException, app_exception_handler
 from app.core.logging import setup_logging
 from app.core.middleware import TimingMiddleware, TraceMiddleware
-from app.core.redis import close_redis
+from app.core.redis import close_redis, ensure_redis_running
 
 # 启动时注册所有 LLM 工具
 import app.services.llm.tools.setup  # noqa: F401
@@ -22,6 +22,7 @@ setup_logging()
 async def lifespan(app: FastAPI):
     """应用生命周期管理。"""
     # 启动时
+    await ensure_redis_running()
     yield
     # 关闭时
     await close_redis()
